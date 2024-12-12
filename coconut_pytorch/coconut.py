@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn, cat, stack, Tensor
 from torch.nn import Module, ModuleList
 
+from einops import rearrange
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -131,14 +132,21 @@ class Coconut(Module):
         self,
         x,
         cached_kv: Tensor | None = None,
-        return_cached_kv = False
+        return_intermediates = False
     ):
-        x = self.token_emb(x)
+
+        is_reasoning_step = x.dtype == torch.float
+
+        if not is_reasoning_step:
+            x = self.token_emb(x)
+        else:
+            assert exists(cached_kv)
+            x = rearrange(x, 'b d -> b 1 d')
 
         cached_kv = default(cached_kv, [])
         cached_kv_iter = iter(cached_kv)
 
-        next_key_values = []
+        next_keys_values = []
 
         for attn, ff in self.layers:
 
@@ -150,18 +158,21 @@ class Coconut(Module):
 
             x = attn_out + x
 
-            next_key_values.append(key_values)
+            next_keys_values.append(key_values)
 
             x = ff(x) + x
 
-        embed = self.norm(x)
+        embeds = self.norm(x)
 
-        logits = self.to_logits(embed)
+        if is_reasoning_step:
+            return embeds[:, -1], next_keys_values
 
-        if not return_cached_kv:
+        logits = self.to_logits(embeds)
+
+        if not return_intermediates:
             return logits
 
-        return logits, stack(next_key_values)
+        return logits, embeds, next_keys_values
 
 # test
 
@@ -173,10 +184,20 @@ if __name__ == '__main__':
         depth = 2
     )
 
-    ids = torch.randint(0, 256, (1, 1024))
+    prompt = torch.randint(0, 256, (1, 1024))
+    answer = torch.randint(0, 256, (1, 64))
 
-    logits, cached_kv = model(ids, return_cached_kv = True)
+    prompt_logits, embeds, cached_kv = model(prompt, return_intermediates = True)
 
-    logits2 = model(ids[:, -1:], cached_kv = cached_kv)
+    latent_token = embeds[:, -1]
 
-    print(logits.shape, logits2.shape)
+    # three reasoning steps with continuous latents (next embed)
+
+    for _ in range(3):
+        latent_token, cached_kv = model(latent_token, cached_kv = cached_kv)
+
+    # answer
+
+    answer_logits = model(answer, cached_kv = cached_kv)
+
+    print(prompt_logits.shape, answer_logits.shape)
