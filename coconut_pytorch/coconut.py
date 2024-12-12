@@ -76,6 +76,9 @@ class Attention(Module):
             k = cat((ck, k), dim = -2)
             v = cat((cv, v), dim = -2)
 
+        if return_cached_kv:
+            cached_kv = stack((k, v))
+
         if exists(self.rotary_pos_emb):
             q, k = self.rotary_pos_emb.rotate_queries_with_cached_keys(q, k)
 
@@ -91,7 +94,7 @@ class Attention(Module):
         if not return_cached_kv:
             return out
 
-        return out, stack((k, v))
+        return out, cached_kv
 
 # main class
 
