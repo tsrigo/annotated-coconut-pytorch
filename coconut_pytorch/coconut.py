@@ -99,7 +99,7 @@ class Attention(Module):
 
 # main class
 
-class Coconut(Module):
+class Transformer(Module):
     def __init__(
         self,
         *,
@@ -174,30 +174,56 @@ class Coconut(Module):
 
         return logits, embeds, next_keys_values
 
+# coconut wrapper around transformer handles recurrence with latent reasoning tokens
+
+class Coconut(Module):
+    def __init__(
+        self,
+        num_reasoning_steps,
+        transformer: dict | Transformer,
+    ):
+        super().__init__()
+
+        if isinstance(transformer, dict):
+            transformer = Transformer(**transformer)
+
+        self.model = transformer
+        self.num_reasoning_steps = num_reasoning_steps
+
+    def forward(
+        self,
+        prompt,
+        answer
+    ):
+        prompt_logits, embeds, cached_kv = self.model(prompt, return_intermediates = True)
+
+        latent_token = embeds[:, -1]
+
+        reasoning_tokens = [latent_token]
+
+        for _ in range(self.num_reasoning_steps):
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv)
+
+            reasoning_tokens.append(latent_token)
+
+        answer_logits = self.model(answer, cached_kv = cached_kv)
+
+        return prompt_logits, reasoning_tokens, answer_logits
+
 # test
 
 if __name__ == '__main__':
 
     model = Coconut(
-        num_tokens = 256,
-        dim = 512,
-        depth = 2
+        num_reasoning_steps = 3,
+        transformer = dict(
+            num_tokens = 256,
+            dim = 512,
+            depth = 2
+        )
     )
 
     prompt = torch.randint(0, 256, (1, 1024))
     answer = torch.randint(0, 256, (1, 64))
 
-    prompt_logits, embeds, cached_kv = model(prompt, return_intermediates = True)
-
-    latent_token = embeds[:, -1]
-
-    # three reasoning steps with continuous latents (next embed)
-
-    for _ in range(3):
-        latent_token, cached_kv = model(latent_token, cached_kv = cached_kv)
-
-    # answer
-
-    answer_logits = model(answer, cached_kv = cached_kv)
-
-    print(prompt_logits.shape, answer_logits.shape)
+    prompt_logits, reasoning_tokens, answer_logits = model(prompt, answer)
