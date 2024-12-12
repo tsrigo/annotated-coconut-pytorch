@@ -132,12 +132,11 @@ class Transformer(Module):
         self,
         x,
         cached_kv: Tensor | None = None,
-        return_intermediates = False
+        return_intermediates = False,
+        return_embed_with_cache_kv = False
     ):
 
-        is_reasoning_step = x.dtype == torch.float
-
-        if not is_reasoning_step:
+        if x.dtype in (torch.int, torch.long):
             x = self.token_emb(x)
 
         cached_kv = default(cached_kv, [])
@@ -161,7 +160,7 @@ class Transformer(Module):
 
         embeds = self.norm(x)
 
-        if is_reasoning_step:
+        if return_embed_with_cache_kv:
             return embeds, next_keys_values
 
         logits = self.to_logits(embeds)
@@ -199,7 +198,7 @@ class Coconut(Module):
         reasoning_tokens = [latent_token]
 
         for _ in range(self.num_reasoning_steps):
-            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv)
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
 
             reasoning_tokens.append(latent_token)
 
