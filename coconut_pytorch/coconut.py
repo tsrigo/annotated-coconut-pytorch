@@ -139,9 +139,6 @@ class Transformer(Module):
 
         if not is_reasoning_step:
             x = self.token_emb(x)
-        else:
-            assert exists(cached_kv)
-            x = rearrange(x, 'b d -> b 1 d')
 
         cached_kv = default(cached_kv, [])
         cached_kv_iter = iter(cached_kv)
@@ -165,7 +162,7 @@ class Transformer(Module):
         embeds = self.norm(x)
 
         if is_reasoning_step:
-            return embeds[:, -1], next_keys_values
+            return embeds, next_keys_values
 
         logits = self.to_logits(embeds)
 
@@ -197,7 +194,7 @@ class Coconut(Module):
     ):
         prompt_logits, embeds, cached_kv = self.model(prompt, return_intermediates = True)
 
-        latent_token = embeds[:, -1]
+        latent_token = embeds[:, -1:]
 
         reasoning_tokens = [latent_token]
 
@@ -207,6 +204,8 @@ class Coconut(Module):
             reasoning_tokens.append(latent_token)
 
         answer_logits = self.model(answer, cached_kv = cached_kv)
+
+        reasoning_tokens = cat(reasoning_tokens, dim = -2)
 
         return prompt_logits, reasoning_tokens, answer_logits
 
