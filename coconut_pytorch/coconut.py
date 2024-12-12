@@ -59,7 +59,8 @@ class Attention(Module):
 
     def forward(
         self,
-        x
+        x,
+        return_cached_kv = False
     ):
 
         x = self.norm(x)
@@ -78,7 +79,12 @@ class Attention(Module):
 
         out = self.merge_heads(out)
 
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if not return_cached_kv:
+            return out
+
+        return out, torch.stack((k, v))
 
 # main class
 
@@ -113,16 +119,31 @@ class Coconut(Module):
 
     def forward(
         self,
-        x
+        x,
+        return_cached_kv = False
     ):
         x = self.token_emb(x)
 
+        all_key_values = []
+
         for attn, ff in self.layers:
-            x = attn(x) + x
+
+            attn_out, key_values = attn(x, return_cached_kv = True)
+
+            x = attn_out + x
+
+            all_key_values.append(key_values)
+
             x = ff(x) + x
 
-        x = self.norm(x)
-        return self.to_logits(x)
+        embed = self.norm(x)
+
+        logits = self.to_logits(embed)
+
+        if not return_cached_kv:
+            return logits
+
+        return logits, torch.stack(all_key_values)
 
 # test
 
