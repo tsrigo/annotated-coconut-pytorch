@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn, cat, stack, Tensor
 from torch.nn import Module, ModuleList
 
 from einops.layers.torch import Rearrange
@@ -60,6 +60,7 @@ class Attention(Module):
     def forward(
         self,
         x,
+        cached_kv: Tensor | None = None,
         return_cached_kv = False
     ):
 
@@ -68,6 +69,12 @@ class Attention(Module):
         qkv = self.to_qkv(x)
 
         q, k, v = self.split_heads(qkv)
+
+        if exists(cached_kv):
+            ck, cv = cached_kv
+
+            k = cat((ck, k), dim = -2)
+            v = cat((cv, v), dim = -2)
 
         if exists(self.rotary_pos_emb):
             q, k = self.rotary_pos_emb.rotate_queries_with_cached_keys(q, k)
@@ -84,7 +91,7 @@ class Attention(Module):
         if not return_cached_kv:
             return out
 
-        return out, torch.stack((k, v))
+        return out, stack((k, v))
 
 # main class
 
@@ -120,19 +127,27 @@ class Coconut(Module):
     def forward(
         self,
         x,
+        cached_kv: Tensor | None = None,
         return_cached_kv = False
     ):
         x = self.token_emb(x)
 
-        all_key_values = []
+        cached_kv = default(cached_kv, [])
+        cached_kv_iter = iter(cached_kv)
+
+        next_key_values = []
 
         for attn, ff in self.layers:
 
-            attn_out, key_values = attn(x, return_cached_kv = True)
+            attn_out, key_values = attn(
+                x,
+                cached_kv = next(cached_kv_iter, None),
+                return_cached_kv = True
+            )
 
             x = attn_out + x
 
-            all_key_values.append(key_values)
+            next_key_values.append(key_values)
 
             x = ff(x) + x
 
@@ -143,7 +158,7 @@ class Coconut(Module):
         if not return_cached_kv:
             return logits
 
-        return logits, torch.stack(all_key_values)
+        return logits, stack(next_key_values)
 
 # test
 
@@ -157,5 +172,8 @@ if __name__ == '__main__':
 
     ids = torch.randint(0, 256, (1, 1024))
 
-    logits = model(ids)
-    print(logits.shape)
+    logits, cached_kv = model(ids, return_cached_kv = True)
+
+    logits2 = model(ids[:, -1:], cached_kv = cached_kv)
+
+    print(logits.shape, logits2.shape)
