@@ -4,6 +4,8 @@
 
 Implementation of Coconut, proposed by the paper <a href="https://arxiv.org/abs/2412.06769">Training Large Language Models to Reason in a Continuous Latent Space</a> out of FAIR, in Pytorch
 
+Architecture wise, the closest work to the one proposed here would be <a href="https://github.com/lucidrains/recurrent-memory-transformer-pytorch">RMT</a>, where the memory tokens there could serve as the continuous latent tokens. Both directions are worth exploring
+
 ## Citation
 
 ```bibtex
