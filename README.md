@@ -1,3 +1,4 @@
+<img src="./coconut.png" width="400px"></img>
 
 ## Coconut (wip)
 
