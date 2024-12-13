@@ -188,7 +188,8 @@ class Coconut(Module):
         transformer: dict | Transformer,
         num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
         learn_begin_of_thought = False,
-        num_hypothesis = 1 # extending the paper, allow for multiple sequence latent streams, merged at the end
+        num_hypothesis = 1, # extending the paper, allow for multiple sequence latent streams, merged at the end
+        synthesize_hypothesis_per_step = False
     ):
         super().__init__()
 
@@ -222,6 +223,12 @@ class Coconut(Module):
             self.to_streams = nn.Sequential(nn.Linear(dim, dim * num_hypothesis), Rearrange('b ... (hyp d) -> (b hyp) ... d', hyp = num_hypothesis))
             self.merge_streams = nn.Sequential(Rearrange('(b hyp) ... d -> b ... (hyp d)', hyp = num_hypothesis), nn.Linear(dim * num_hypothesis, dim))
 
+            self.maybe_synth_streams = nn.Sequential(
+                Rearrange('(b hyp) n d -> b n (hyp d)', hyp = num_hypothesis),
+                nn.Linear(dim * num_hypothesis, dim * num_hypothesis),
+                Rearrange('b n (hyp d) -> (b hyp) n d', hyp = num_hypothesis),
+            ) if synthesize_hypothesis_per_step else nn.Identity()
+
     def forward(
         self,
         prompt,
@@ -237,7 +244,7 @@ class Coconut(Module):
         l - logits (num tokens)
         """
 
-        batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
+        batch, num_thoughts, has_multi_hyp = prompt.shape[0], self.begin_of_thought.shape[0], self.has_multiple_hypothesis
 
         # prepare <bot> and <eot> in paper
 
@@ -269,7 +276,7 @@ class Coconut(Module):
 
         # handle maybe multiple hypothesis
 
-        if self.has_multiple_hypothesis:
+        if has_multi_hyp:
             latent_token = self.to_streams(latent_token)
 
             cached_kv = repeat(cached_kv, '... b h n d -> ... (b hyp) h n d', hyp = self.num_hypothesis)
@@ -281,11 +288,14 @@ class Coconut(Module):
         for _ in range(self.num_reasoning_steps - 1):
             latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
 
+            if has_multi_hyp:
+                latent_token = self.maybe_synth_streams(latent_token)
+
             latent_tokens.append(latent_token)
 
         # merge hypothesis if needed
 
-        if self.has_multiple_hypothesis:
+        if has_multi_hyp:
             latent_token = self.merge_streams(latent_token)
             cached_kv = reduce(cached_kv, '... (b hyp) h n d -> ... b h n d', 'mean', hyp = self.num_hypothesis)
 
