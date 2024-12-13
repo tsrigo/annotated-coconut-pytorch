@@ -188,6 +188,8 @@ class Coconut(Module):
         transformer: dict | Transformer,
         num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
         learn_begin_of_thought = False,
+        num_hypothesis = 1, # extending the paper, allow for multiple sequence latent streams, merged at the end
+        synthesize_hypothesis_per_step = False
     ):
         super().__init__()
 
@@ -212,6 +214,38 @@ class Coconut(Module):
         self.learn_begin_of_thought = learn_begin_of_thought
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+        # project latents to multiple streams
+
+        self.num_hypothesis = num_hypothesis
+        self.has_multiple_hypothesis = num_hypothesis > 1
+
+        if self.has_multiple_hypothesis:
+            streams = num_hypothesis
+            eye = torch.eye(dim)
+
+            self.to_streams = nn.Sequential(nn.Linear(dim, dim * streams), Rearrange('b ... (hyp d) -> (b hyp) ... d', hyp = streams))
+            self.merge_streams = nn.Sequential(Rearrange('(b hyp) ... d -> b ... (hyp d)', hyp = num_hypothesis), nn.Linear(dim * streams, dim))
+            self.maybe_synth_streams = nn.Identity()
+
+            if synthesize_hypothesis_per_step:
+                self.maybe_synth_streams = nn.Sequential(
+                    Rearrange('(b hyp) n d -> b n (hyp d)', hyp = streams),
+                    nn.Linear(dim * streams, dim * streams),
+                    Rearrange('b n (hyp d) -> (b hyp) n d', hyp = streams),
+                )
+
+            # init to identity
+
+            self.to_streams[0].weight.data.copy_(repeat(eye, 'i j -> (r i) j', r = streams))
+            self.to_streams[0].bias.data.zero_()
+
+            self.merge_streams[-1].weight.data.copy_(repeat(eye, 'i j -> i (r j)', r = streams))
+            self.merge_streams[-1].bias.data.zero_()
+
+            if synthesize_hypothesis_per_step:
+                self.maybe_synth_streams[1].weight.data.copy_(repeat(eye, 'i j -> (r1 i) (r2 j)', r1 = streams, r2 = streams))
+                self.maybe_synth_streams[1].bias.data.zero_()
+
     def forward(
         self,
         prompt,
@@ -227,7 +261,7 @@ class Coconut(Module):
         l - logits (num tokens)
         """
 
-        batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
+        batch, num_thoughts, has_multi_hyp = prompt.shape[0], self.begin_of_thought.shape[0], self.has_multiple_hypothesis
 
         # prepare <bot> and <eot> in paper
 
@@ -257,6 +291,13 @@ class Coconut(Module):
 
         latent_token = embeds[:, -num_thoughts:]
 
+        # handle maybe multiple hypothesis
+
+        if has_multi_hyp:
+            latent_token = self.to_streams(latent_token)
+
+            cached_kv = repeat(cached_kv, '... b h n d -> ... (b hyp) h n d', hyp = self.num_hypothesis)
+
         # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
 
         latent_tokens = [latent_token]
@@ -264,7 +305,16 @@ class Coconut(Module):
         for _ in range(self.num_reasoning_steps - 1):
             latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
 
+            if has_multi_hyp:
+                latent_token = self.maybe_synth_streams(latent_token)
+
             latent_tokens.append(latent_token)
+
+        # merge hypothesis if needed
+
+        if has_multi_hyp:
+            latent_token = self.merge_streams(latent_token)
+            cached_kv = reduce(cached_kv, '... (b hyp) h n d -> ... b h n d', 'mean', hyp = self.num_hypothesis)
 
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
@@ -274,7 +324,8 @@ class Coconut(Module):
 
         # concat the latent reasoning tokens to be passed out for study
 
-        latent_tokens = cat(latent_tokens, dim = -2)
+        if not self.has_multiple_hypothesis:
+            latent_tokens = cat(latent_tokens, dim = -2)
 
         intermediates = prompt_logits, latent_tokens, answer_logits
 
