@@ -30,7 +30,7 @@ model = Coconut(
 prompt = torch.randint(0, 256, (1, 1024))
 answer = torch.randint(0, 256, (1, 64))
 
-loss, (prompt_logits, latent_tokens, answer_logits) = model(prompt, answer)
+loss, (loss_breakdown, prompt_logits, latent_tokens, answer_logits) = model(prompt, answer)
 
 loss.backward()
 

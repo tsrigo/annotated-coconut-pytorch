@@ -278,6 +278,8 @@ class Coconut(Module):
             answer
         )
 
+        loss_breakdown = (answer_loss, bot_loss)
+
         total_loss = (answer_loss + bot_loss)
 
-        return answer_loss, intermediates
+        return total_loss, (loss_breakdown, *intermediates)
