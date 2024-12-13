@@ -20,6 +20,7 @@ from coconut_pytorch import Coconut
 
 model = Coconut(
     num_reasoning_steps = 3,
+    num_latents_per_step = 1,
     transformer = dict(
         num_tokens = 256,
         dim = 512,

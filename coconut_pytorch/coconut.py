@@ -186,7 +186,8 @@ class Coconut(Module):
         self,
         num_reasoning_steps,
         transformer: dict | Transformer,
-        learn_begin_of_thought = False
+        num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
+        learn_begin_of_thought = False,
     ):
         super().__init__()
 
@@ -200,7 +201,7 @@ class Coconut(Module):
 
         # begin and end of thought tokens, handled external to transformer
 
-        self.begin_of_thought = nn.Parameter(torch.zeros(dim))
+        self.begin_of_thought = nn.Parameter(torch.zeros(num_latents_per_step, dim))
         self.end_of_thought = nn.Parameter(torch.zeros(dim))
 
         nn.init.normal_(self.begin_of_thought, std = 0.02)
@@ -217,11 +218,19 @@ class Coconut(Module):
         answer,
         return_loss = True
     ):
-        batch = prompt.shape[0]
+        """
+        ein notation:
+        b - batch
+        n - seq (number of reasoning tokens, etc)
+        d - feature dimension
+        l - logits (num tokens)
+        """
+
+        batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
 
         # prepare <bot> and <eot> in paper
 
-        begin_thought = repeat(self.begin_of_thought, 'd -> b 1 d', b = batch)
+        begin_thought = repeat(self.begin_of_thought, 'n d -> b n d', b = batch)
         end_thought = repeat(self.end_of_thought, 'd -> b 1 d', b = batch)
 
         # give the model the prompt
@@ -235,7 +244,7 @@ class Coconut(Module):
         if self.learn_begin_of_thought:
             pred_bot_embed, rest_logits = embeds[:, -2], prompt_logits[:, -2]
 
-            pred_bot_logits = einsum('b d, d -> b', pred_bot_embed, self.begin_of_thought)
+            pred_bot_logits = einsum('b d, d -> b', pred_bot_embed, self.begin_of_thought[0])
             pred_bot_logits = rearrange(pred_bot_logits, 'b -> b 1')
 
             bot_logits = cat((pred_bot_logits, rest_logits), dim = -1)
@@ -245,7 +254,7 @@ class Coconut(Module):
 
         # extract latent reasoning token off <bot> position
 
-        latent_token = embeds[:, -1:]
+        latent_token = embeds[:, -num_thoughts:]
 
         # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
 
@@ -260,7 +269,7 @@ class Coconut(Module):
 
         logits = self.model([latent_token, end_thought, answer[..., :-1]], cached_kv = cached_kv)
 
-        answer_logits = logits[:, 1:]
+        answer_logits = logits[:, num_thoughts:]
 
         # concat the latent reasoning tokens to be passed out for study
 
