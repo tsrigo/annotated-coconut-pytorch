@@ -47,3 +47,14 @@ loss.backward()
     url     = {https://api.semanticscholar.org/CorpusID:274610816}
 }
 ```
+
+```bibtex
+@article{Burtsev2021MultiStreamT,
+    title   = {Multi-Stream Transformers},
+    author  = {Mikhail S. Burtsev and Anna Rumshisky},
+    journal = {ArXiv},
+    year    = {2021},
+    volume  = {abs/2107.10342},
+    url     = {https://api.semanticscholar.org/CorpusID:236171087}
+}
+```
