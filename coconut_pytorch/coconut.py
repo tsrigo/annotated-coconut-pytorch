@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn, cat, stack, Tensor
+from torch import nn, cat, stack, einsum, Tensor
 from torch.nn import Module, ModuleList
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, pack
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -186,6 +186,7 @@ class Coconut(Module):
         self,
         num_reasoning_steps,
         transformer: dict | Transformer,
+        learn_begin_of_thought = False
     ):
         super().__init__()
 
@@ -197,11 +198,18 @@ class Coconut(Module):
         self.model = transformer
         self.num_reasoning_steps = num_reasoning_steps
 
+        # begin and end of thought tokens, handled external to transformer
+
         self.begin_of_thought = nn.Parameter(torch.zeros(dim))
         self.end_of_thought = nn.Parameter(torch.zeros(dim))
 
         nn.init.normal_(self.begin_of_thought, std = 0.02)
         nn.init.normal_(self.end_of_thought, std = 0.02)
+
+        # whether to teach model when to begin a thought
+
+        self.learn_begin_of_thought = learn_begin_of_thought
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     def forward(
         self,
@@ -219,6 +227,21 @@ class Coconut(Module):
         # give the model the prompt
 
         prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], return_intermediates = True)
+
+        # loss for decoding a <bot>
+
+        bot_loss = self.zero
+
+        if self.learn_begin_of_thought:
+            pred_bot_embed, rest_logits = embeds[:, -2], prompt_logits[:, -2]
+
+            pred_bot_logits = einsum('b d, d -> b', pred_bot_embed, self.begin_of_thought)
+            pred_bot_logits = rearrange(pred_bot_logits, 'b -> b 1')
+
+            bot_logits = cat((pred_bot_logits, rest_logits), dim = -1)
+            bot_labels = bot_logits.new_zeros((batch,), dtype = torch.long)
+
+            bot_loss = F.cross_entropy(bot_logits, bot_labels)
 
         # extract latent reasoning token off <bot> position
 
@@ -254,5 +277,7 @@ class Coconut(Module):
             rearrange(answer_logits, 'b n l -> b l n'),
             answer
         )
+
+        total_loss = (answer_loss + bot_loss)
 
         return answer_loss, intermediates
