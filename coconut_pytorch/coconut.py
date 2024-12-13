@@ -206,7 +206,8 @@ class Coconut(Module):
     def forward(
         self,
         prompt,
-        answer
+        answer,
+        return_loss = True
     ):
         batch = prompt.shape[0]
 
@@ -234,10 +235,24 @@ class Coconut(Module):
 
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
-        answer_logits = self.model([latent_token, end_thought, answer], cached_kv = cached_kv)
+        logits = self.model([latent_token, end_thought, answer[..., :-1]], cached_kv = cached_kv)
+
+        answer_logits = logits[:, 1:]
 
         # concat the latent reasoning tokens to be passed out for study
 
         latent_tokens = cat(latent_tokens, dim = -2)
 
-        return prompt_logits, latent_tokens, answer_logits
+        intermediates = prompt_logits, latent_tokens, answer_logits
+
+        if not return_loss:
+            return intermediates
+
+        # handle the loss on the answers
+
+        answer_loss = F.cross_entropy(
+            rearrange(answer_logits, 'b n l -> b l n'),
+            answer
+        )
+
+        return answer_loss, intermediates
