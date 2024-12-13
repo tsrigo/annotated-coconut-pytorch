@@ -297,6 +297,9 @@ class Coconut(Module):
 
         # concat the latent reasoning tokens to be passed out for study
 
+        if not self.has_multiple_hypothesis:
+            latent_tokens = cat(latent_tokens, dim = -2)
+
         intermediates = prompt_logits, latent_tokens, answer_logits
 
         if not return_loss:
