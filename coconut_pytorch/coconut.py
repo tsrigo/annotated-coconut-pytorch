@@ -225,12 +225,12 @@ class Coconut(Module):
 
         # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
 
-        reasoning_tokens = [latent_token]
+        latent_tokens = [latent_token]
 
         for _ in range(self.num_reasoning_steps - 1):
             latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
 
-            reasoning_tokens.append(latent_token)
+            latent_tokens.append(latent_token)
 
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
@@ -238,6 +238,6 @@ class Coconut(Module):
 
         # concat the latent reasoning tokens to be passed out for study
 
-        reasoning_tokens = cat(reasoning_tokens, dim = -2)
+        latent_tokens = cat(latent_tokens, dim = -2)
 
-        return prompt_logits, reasoning_tokens, answer_logits
+        return prompt_logits, latent_tokens, answer_logits
