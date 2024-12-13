@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn, cat, stack, Tensor
 from torch.nn import Module, ModuleList
 
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -111,6 +111,7 @@ class Transformer(Module):
         ff_mult = 4
     ):
         super().__init__()
+        self.dim = dim
 
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.rotary_emb = RotaryEmbedding(dim_head)
@@ -130,14 +131,22 @@ class Transformer(Module):
 
     def forward(
         self,
-        x,
+        inp: Tensor | list[Tensor],
         cached_kv: Tensor | None = None,
         return_intermediates = False,
         return_embed_with_cache_kv = False
     ):
 
-        if x.dtype in (torch.int, torch.long):
-            x = self.token_emb(x)
+        # handle input, which can be a list of Tensor of Float['b n d'] or Int['b n']
+
+        if not isinstance(inp, list):
+            inp = [inp]
+
+        inp = [self.token_emb(t) if t.dtype in (torch.int, torch.long) else t for t in inp]
+
+        x = cat(inp, dim = -2)
+
+        # cached key values need to be handled with priority and care for this paper
 
         cached_kv = default(cached_kv, [])
         cached_kv_iter = iter(cached_kv)
@@ -183,45 +192,52 @@ class Coconut(Module):
         if isinstance(transformer, dict):
             transformer = Transformer(**transformer)
 
+        dim = transformer.dim
+
         self.model = transformer
         self.num_reasoning_steps = num_reasoning_steps
+
+        self.begin_of_thought = nn.Parameter(torch.zeros(dim))
+        self.end_of_thought = nn.Parameter(torch.zeros(dim))
+
+        nn.init.normal_(self.begin_of_thought, std = 0.02)
+        nn.init.normal_(self.end_of_thought, std = 0.02)
 
     def forward(
         self,
         prompt,
         answer
     ):
-        prompt_logits, embeds, cached_kv = self.model(prompt, return_intermediates = True)
+        batch = prompt.shape[0]
+
+        # prepare <bot> and <eot> in paper
+
+        begin_thought = repeat(self.begin_of_thought, 'd -> b 1 d', b = batch)
+        end_thought = repeat(self.end_of_thought, 'd -> b 1 d', b = batch)
+
+        # give the model the prompt
+
+        prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], return_intermediates = True)
+
+        # extract latent reasoning token off <bot> position
 
         latent_token = embeds[:, -1:]
 
+        # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
+
         reasoning_tokens = [latent_token]
 
-        for _ in range(self.num_reasoning_steps):
+        for _ in range(self.num_reasoning_steps - 1):
             latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
 
             reasoning_tokens.append(latent_token)
 
-        answer_logits = self.model(answer, cached_kv = cached_kv)
+        # final step, latent token and end thought token, as well as answer sequence is appended together
+
+        answer_logits = self.model([latent_token, end_thought, answer], cached_kv = cached_kv)
+
+        # concat the latent reasoning tokens to be passed out for study
 
         reasoning_tokens = cat(reasoning_tokens, dim = -2)
 
         return prompt_logits, reasoning_tokens, answer_logits
-
-# test
-
-if __name__ == '__main__':
-
-    model = Coconut(
-        num_reasoning_steps = 3,
-        transformer = dict(
-            num_tokens = 256,
-            dim = 512,
-            depth = 2
-        )
-    )
-
-    prompt = torch.randint(0, 256, (1, 1024))
-    answer = torch.randint(0, 256, (1, 64))
-
-    prompt_logits, reasoning_tokens, answer_logits = model(prompt, answer)
