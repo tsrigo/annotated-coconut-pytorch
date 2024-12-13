@@ -215,7 +215,7 @@ class Coconut(Module):
     def forward(
         self,
         prompt,
-        answer,
+        answer = None,
         return_loss = True
     ):
         """
@@ -266,9 +266,16 @@ class Coconut(Module):
 
             latent_tokens.append(latent_token)
 
+        # final model forward inputs
+
+        final_forward = [latent_token, end_thought]
+
+        if exists(answer):
+            final_forward.append(answer[..., :-1])
+
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
-        logits = self.model([latent_token, end_thought, answer[..., :-1]], cached_kv = cached_kv)
+        logits = self.model(final_forward, cached_kv = cached_kv)
 
         answer_logits = logits[:, num_thoughts:]
 
@@ -278,7 +285,7 @@ class Coconut(Module):
 
         intermediates = prompt_logits, latent_tokens, answer_logits
 
-        if not return_loss:
+        if not return_loss or not exists(answer):
             return intermediates
 
         # handle the loss on the answers
