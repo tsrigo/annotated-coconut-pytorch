@@ -20,6 +20,27 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+# sampling helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
+
+def min_p_filter(logits, min_p = 0.1):
+    """
+    https://arxiv.org/abs/2407.01082
+    """
+    probs = logits.softmax(dim = -1)
+    max_probs = probs.amax(dim = -1, keepdim = True)
+    limit = min_p * max_probs
+    return torch.where(probs < limit, float('-inf'), logits)
+
 # swiglu feedforward, Shazeer et al.
 
 class GEGLU(Module):
@@ -249,11 +270,39 @@ class Coconut(Module):
                 self.maybe_synth_streams[1].weight.data.copy_(repeat(eye, 'i j -> (r1 i) (r2 j)', r1 = streams, r2 = streams))
                 self.maybe_synth_streams[1].bias.data.zero_()
 
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt,
+        max_length = 16,
+        filter_fn = min_p_filter,
+        filter_kwargs: dict = dict(),
+        temperature = 1.
+    ):
+        prompt_logits, latent_tokens, answer_logits, cached_kv = self.forward(prompt)
+
+        out = prompt[:, 0:0]
+
+        def sample(logits):
+            nonlocal out
+            logits = filter_fn(logits[:, -1], **filter_kwargs)
+            sampled = gumbel_sample(logits, temperature = temperature)
+            out = cat((out, sampled), dim = -1)
+
+        sample(answer_logits)
+
+        for _ in range(max_length - 1):
+            answer_logits = self.model(out[:, -1:], cached_kv = cached_kv)
+            sample(answer_logits)
+
+        return out
+
     def forward(
         self,
         prompt,
-        answer,
-        return_loss = True
+        answer = None,
+        return_loss = True,
+        return_intermediates = False
     ):
         """
         ein notation:
@@ -340,7 +389,12 @@ class Coconut(Module):
 
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
-        logits = self.model([latent_token, end_thought, answer[..., :-1]], cached_kv = cached_kv)
+        final_model_forward = [latent_token, end_thought]
+
+        if exists(answer):
+            final_model_forward.append(answer[..., :-1])
+
+        logits = self.model(final_model_forward, cached_kv = cached_kv)
 
         answer_logits = logits[:, num_thoughts:]
 
@@ -349,9 +403,9 @@ class Coconut(Module):
         if not self.has_multiple_hypothesis:
             latent_tokens = cat(latent_tokens, dim = -2)
 
-        intermediates = prompt_logits, latent_tokens, answer_logits
+        intermediates = prompt_logits, latent_tokens, answer_logits, cached_kv
 
-        if not return_loss:
+        if not return_loss or not exists(answer):
             return intermediates
 
         # handle the loss on the answers
@@ -364,5 +418,8 @@ class Coconut(Module):
         loss_breakdown = (answer_loss, bot_loss)
 
         total_loss = (answer_loss + bot_loss)
+
+        if not return_intermediates:
+            return total_loss
 
         return total_loss, (loss_breakdown, *intermediates)

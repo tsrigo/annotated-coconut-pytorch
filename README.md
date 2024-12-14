@@ -24,17 +24,19 @@ model = Coconut(
     transformer = dict(
         num_tokens = 256,
         dim = 512,
-        depth = 2
+        depth = 6
     )
 )
 
-prompt = torch.randint(0, 256, (1, 1024))
-answer = torch.randint(0, 256, (1, 64))
+prompt = torch.randint(0, 256, (2, 1024))
+answer = torch.randint(0, 256, (2, 64))
 
-loss, (loss_breakdown, prompt_logits, latent_tokens, answer_logits) = model(prompt, answer)
-
+loss = model(prompt, answer)
 loss.backward()
 
+# after much training
+
+answer = model.generate(prompt, max_length = 64) # (2, 64)
 ```
 
 ## Citation
