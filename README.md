@@ -1,6 +1,6 @@
 <img src="./coconut.png" width="400px"></img>
 
-## 🥥 Coconut (wip)
+## 🥥 Coconut
 
 Implementation of Coconut, proposed by the paper <a href="https://arxiv.org/abs/2412.06769">Training Large Language Models to Reason in a Continuous Latent Space</a> out of FAIR, in Pytorch
 
