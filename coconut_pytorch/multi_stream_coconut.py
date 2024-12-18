@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, cat, stack, einsum, Tensor
 from torch.nn import Module, ModuleList
+from torch.utils.checkpoint import checkpoint_sequential
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
@@ -213,7 +214,8 @@ class Coconut(Module):
         num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
         learn_begin_of_thought = False,
         num_hypothesis = 1, # extending the paper, allow for multiple sequence latent streams, merged at the end
-        synthesize_hypothesis_per_step = False
+        synthesize_hypothesis_per_step = False,
+        checkpoint = False
     ):
         super().__init__()
 
@@ -237,6 +239,10 @@ class Coconut(Module):
 
         self.learn_begin_of_thought = learn_begin_of_thought
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
+        # checkpoint
+
+        self.checkpoint = checkpoint
 
         # project latents to multiple streams
 
@@ -297,6 +303,73 @@ class Coconut(Module):
 
         return out
 
+    def checkpointed_recurrent_latent_forward(
+        self,
+        latent_token,
+        cached_kv
+    ):
+        if not torch.is_tensor(cached_kv):
+            cached_kv = stack(cached_kv)
+
+        num_recurrent_steps = self.num_reasoning_steps - 1
+
+        # recurrent model forward with next latent token + past cached kv, but checkpointed
+
+        latent_tokens = [latent_token, *((None,) * num_recurrent_steps)]
+
+        def recurrent_step(step_inputs):
+            i, latent_token, *latent_tokens, cached_kv = step_inputs
+
+            i += 1
+
+            is_last_step = i == num_recurrent_steps
+
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
+
+            if self.has_multiple_hypothesis and not is_last_step:
+                latent_token = self.maybe_synth_streams(latent_token)
+
+            latent_tokens[i] = latent_token
+
+            return (i, latent_token, *latent_tokens, stack(cached_kv))
+
+        # functions
+
+        fns = [recurrent_step] * num_recurrent_steps
+
+        # initial input
+
+        inputs = (0, latent_token, *latent_tokens, cached_kv)
+
+        # forward checkpoint sequential
+
+        _, latent_token, *latent_tokens, cached_kv = checkpoint_sequential(fns, 1, input = inputs, use_reentrant = False)
+
+        return latent_token, latent_tokens, cached_kv
+
+    def recurrent_latent_forward(
+        self,
+        latent_token,
+        cached_kv
+    ):
+        # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
+
+        latent_tokens = [latent_token]
+
+        num_recurrent_steps = self.num_reasoning_steps - 1
+
+        for i in range(num_recurrent_steps):
+            is_last_step = i == (num_recurrent_steps - 1)
+
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
+
+            if self.has_multiple_hypothesis and not is_last_step:
+                latent_token = self.maybe_synth_streams(latent_token)
+
+            latent_tokens.append(latent_token)
+
+        return latent_token, latent_tokens, cached_kv
+
     def forward(
         self,
         prompt,
@@ -352,17 +425,16 @@ class Coconut(Module):
 
             num_steps_multistream = self.num_reasoning_steps - 1
 
-        # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
+        # whether to checkpoint or not
 
-        latent_tokens = [latent_token]
+        should_checkpoint = self.training and self.checkpoint and latent_token.requires_grad
 
-        for _ in range(self.num_reasoning_steps - 1):
-            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
+        # route to right functions
 
-            if has_multi_hyp:
-                latent_token = self.maybe_synth_streams(latent_token)
-
-            latent_tokens.append(latent_token)
+        if should_checkpoint:
+            latent_token, latent_tokens, cached_kv = self.checkpointed_recurrent_latent_forward(latent_token, cached_kv)
+        else:
+            latent_token, latent_tokens, cached_kv = self.recurrent_latent_forward(latent_token, cached_kv)
 
         # merge hypothesis if needed
 
