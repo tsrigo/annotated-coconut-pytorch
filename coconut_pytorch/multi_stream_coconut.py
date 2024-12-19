@@ -93,7 +93,8 @@ class Attention(Module):
         x,
         mask: Tensor | None = None,
         cached_kv: Tensor | None = None,
-        return_cached_kv = False
+        return_cached_kv = False,
+        rotary_pos_emb = None
     ):
 
         x = self.norm(x)
@@ -111,10 +112,11 @@ class Attention(Module):
         if return_cached_kv:
             cached_kv = stack((k, v))
 
-        if exists(self.rotary_pos_emb):
-            q, k = self.rotary_pos_emb.rotate_queries_with_cached_keys(q, k)
+        if exists(rotary_pos_emb):
+            q = apply_rotary_emb(rotary_pos_emb, q)
+            k = apply_rotary_emb(rotary_pos_emb, k)
 
-        out = self.attend(q, k, v, mask = mask)
+        out, _ = self.attend(q, k, v, mask = mask)
 
         out = self.merge_heads(out)
 
@@ -173,6 +175,18 @@ class Transformer(Module):
         inp = [self.token_emb(t) if t.dtype in (torch.int, torch.long) else t for t in inp]
 
         x = cat(inp, dim = -2)
+
+        # determine cached kv length
+
+        cached_kv_len = cached_kv.shape[-2] if exists(cached_kv) else 0.
+
+        # rotary pos emb
+
+        total_seq_len = x.shape[-2] + cached_kv_len
+
+        seq = torch.arange(total_seq_len, device = x.device)
+
+        rotary_pos_emb = self.rotary_emb(seq)
 
         # cached key values need to be handled with priority and care for this paper
 

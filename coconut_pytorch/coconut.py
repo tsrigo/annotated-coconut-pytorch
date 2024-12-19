@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint_sequential
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
 from x_transformers.attend import Attend
 
@@ -73,8 +73,6 @@ class Attention(Module):
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
 
-        self.rotary_pos_emb = rotary_pos_emb
-
         self.norm = nn.RMSNorm(dim)
 
         self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 3, h = heads)
@@ -90,7 +88,8 @@ class Attention(Module):
         x,
         mask: Tensor | None = None,
         cached_kv: Tensor | None = None,
-        return_cached_kv = False
+        return_cached_kv = False,
+        rotary_pos_emb = None
     ):
 
         x = self.norm(x)
@@ -108,8 +107,9 @@ class Attention(Module):
         if return_cached_kv:
             cached_kv = stack((k, v))
 
-        if exists(self.rotary_pos_emb):
-            q, k = self.rotary_pos_emb.rotate_queries_with_cached_keys(q, k)
+        if exists(rotary_pos_emb):
+            q = apply_rotary_emb(rotary_pos_emb, q)
+            k = apply_rotary_emb(rotary_pos_emb, k)
 
         out, _ = self.attend(q, k, v, mask = mask)
 
@@ -171,6 +171,18 @@ class Transformer(Module):
 
         x = cat(inp, dim = -2)
 
+        # determine cached kv length
+
+        cached_kv_len = cached_kv.shape[-2] if exists(cached_kv) else 0.
+
+        # rotary pos emb
+
+        total_seq_len = x.shape[-2] + cached_kv_len
+
+        seq = torch.arange(total_seq_len, device = x.device)
+
+        rotary_pos_emb = self.rotary_emb(seq)
+
         # cached key values need to be handled with priority and care for this paper
 
         cached_kv = default(cached_kv, [])
@@ -182,6 +194,7 @@ class Transformer(Module):
 
             attn_out, key_values = attn(
                 x,
+                rotary_pos_emb = rotary_pos_emb,
                 cached_kv = next(cached_kv_iter, None),
                 return_cached_kv = True
             )
