@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn, cat, stack, einsum, Tensor
 from torch.nn import Module, ModuleList
+
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.checkpoint import checkpoint_sequential
 
 from einops import rearrange, repeat, reduce
@@ -19,6 +21,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def append(t, value, num = 1):
+    return F.pad(t, (0, num), value = value)
 
 # sampling helpers
 
@@ -108,7 +113,7 @@ class Attention(Module):
             cached_kv = stack((k, v))
 
         if exists(rotary_pos_emb):
-            q = apply_rotary_emb(rotary_pos_emb, q)
+            q = apply_rotary_emb(rotary_pos_emb, q, freqs_seq_dim = -2)
             k = apply_rotary_emb(rotary_pos_emb, k)
 
         out, _ = self.attend(q, k, v, mask = mask)
@@ -158,6 +163,7 @@ class Transformer(Module):
         self,
         inp: Tensor | list[Tensor],
         cached_kv: Tensor | None = None,
+        mask: Tensor | None = None,
         return_intermediates = False,
         return_embed_with_cache_kv = False
     ):
@@ -173,13 +179,18 @@ class Transformer(Module):
 
         # determine cached kv length
 
-        cached_kv_len = cached_kv.shape[-2] if exists(cached_kv) else 0.
+        cached_kv_len = cached_kv[0].shape[-2] if exists(cached_kv) else 0.
 
         # rotary pos emb
 
-        total_seq_len = x.shape[-2] + cached_kv_len
+        if exists(mask):
+            seq = mask.cumsum(dim = -1)
+            seq = rearrange(seq, 'b n -> b 1 n')
 
-        seq = torch.arange(total_seq_len, device = x.device)
+        else:
+            total_seq_len = x.shape[-2] + cached_kv_len
+
+            seq = torch.arange(total_seq_len, device = x.device)
 
         rotary_pos_emb = self.rotary_emb(seq)
 
@@ -285,7 +296,8 @@ class Coconut(Module):
     def checkpointed_recurrent_latent_forward(
         self,
         latent_token,
-        cached_kv
+        cached_kv,
+        mask
     ):
         if not torch.is_tensor(cached_kv):
             cached_kv = stack(cached_kv)
@@ -297,15 +309,17 @@ class Coconut(Module):
         latent_tokens = [latent_token, *((None,) * num_recurrent_steps)]
 
         def recurrent_step(step_inputs):
-            i, latent_token, *latent_tokens, cached_kv = step_inputs
+            i, latent_token, *latent_tokens, cached_kv, mask = step_inputs
 
             i += 1
 
-            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
+            mask = append(mask, True)
+
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, mask = mask, return_embed_with_cache_kv = True)
 
             latent_tokens[i] = latent_token
 
-            return (i, latent_token, *latent_tokens, stack(cached_kv))
+            return (i, latent_token, *latent_tokens, stack(cached_kv), mask)
 
         # functions
 
@@ -313,34 +327,38 @@ class Coconut(Module):
 
         # initial input
 
-        inputs = (0, latent_token, *latent_tokens, cached_kv)
+        inputs = (0, latent_token, *latent_tokens, cached_kv, mask)
 
         # forward checkpoint sequential
 
-        _, latent_token, *latent_tokens, cached_kv = checkpoint_sequential(fns, 1, input = inputs, use_reentrant = False)
+        _, latent_token, *latent_tokens, cached_kv, mask = checkpoint_sequential(fns, 1, input = inputs, use_reentrant = False)
 
-        return latent_token, latent_tokens, cached_kv
+        return latent_token, latent_tokens, cached_kv, mask
 
     def recurrent_latent_forward(
         self,
         latent_token,
-        cached_kv
+        cached_kv,
+        mask
     ):
         # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
 
         latent_tokens = [latent_token]
 
         for _ in range(self.num_reasoning_steps - 1):
-            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, return_embed_with_cache_kv = True)
+
+            mask = append(mask, True)
+
+            latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, mask = mask, return_embed_with_cache_kv = True)
 
             latent_tokens.append(latent_token)
 
-        return latent_token, latent_tokens, cached_kv
+        return latent_token, latent_tokens, cached_kv, mask
 
     def forward(
         self,
-        prompt,
-        answer = None,
+        prompt: Tensor | list[Tensor],
+        answer: Tensor | list[Tensor] | None = None,
         return_loss = True,
         return_intermediates = False
     ):
@@ -353,6 +371,20 @@ class Coconut(Module):
         l - logits (num tokens)
         """
 
+        # handle variable length prompts
+
+        if isinstance(prompt, (list, tuple)):
+            prompt = pad_sequence(prompt, padding_value = -1, batch_first = True)
+
+        if exists(answer) and isinstance(answer, (list, tuple)):
+            answer = pad_sequence(answer, padding_value = -1, batch_first = True)
+
+        mask = prompt >= 0
+
+        prompt = prompt.masked_fill(~mask, 0)
+
+        # shape and variables
+
         batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
 
         # prepare <bot> and <eot> in paper
@@ -362,7 +394,9 @@ class Coconut(Module):
 
         # give the model the prompt
 
-        prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], return_intermediates = True)
+        mask = append(mask, True)
+
+        prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], mask = mask, return_intermediates = True)
 
         # loss for decoding a <bot>
 
@@ -390,20 +424,29 @@ class Coconut(Module):
         # route to right functions
 
         if should_checkpoint:
-            latent_token, latent_tokens, cached_kv = self.checkpointed_recurrent_latent_forward(latent_token, cached_kv)
+            latent_token, latent_tokens, cached_kv, mask = self.checkpointed_recurrent_latent_forward(latent_token, cached_kv, mask = mask)
         else:
-            latent_token, latent_tokens, cached_kv = self.recurrent_latent_forward(latent_token, cached_kv)
+            latent_token, latent_tokens, cached_kv, mask = self.recurrent_latent_forward(latent_token, cached_kv, mask = mask)
 
         # final model forward inputs
 
         final_forward = [latent_token, end_thought]
 
+        mask = append(mask, True, 2)
+
         if exists(answer):
-            final_forward.append(answer[..., :-1])
+            answer_input = answer[..., :-1]
+            answer_input_mask = answer_input >= 0
+
+            answer_input = answer_input.masked_fill(~answer_input_mask, 0)
+
+            mask = torch.cat((mask, answer_input_mask), dim = -1)
+
+            final_forward.append(answer_input)
 
         # final step, latent token and end thought token, as well as answer sequence is appended together
 
-        logits = self.model(final_forward, cached_kv = cached_kv)
+        logits = self.model(final_forward, cached_kv = cached_kv, mask = mask)
 
         answer_logits = logits[:, num_thoughts:]
 
@@ -420,7 +463,8 @@ class Coconut(Module):
 
         answer_loss = F.cross_entropy(
             rearrange(answer_logits, 'b n l -> b l n'),
-            answer
+            answer,
+            ignore_index = -1
         )
 
         loss_breakdown = (answer_loss, bot_loss)
