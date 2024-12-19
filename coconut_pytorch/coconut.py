@@ -10,6 +10,8 @@ from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
+from x_transformers.attend import Attend
+
 # helper functions
 
 def exists(v):
@@ -64,6 +66,7 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
+        attend_kwargs: dict = dict(),
         rotary_pos_emb: RotaryEmbedding | None = None
     ):
         super().__init__()
@@ -77,12 +80,15 @@ class Attention(Module):
         self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 3, h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
+        self.attend = Attend(causal = True, **attend_kwargs)
+
         self.to_qkv = nn.Linear(dim, dim_inner * 3, bias = False)
         self.to_out = nn.Linear(dim_inner, dim, bias = False)
 
     def forward(
         self,
         x,
+        mask: Tensor | None = None,
         cached_kv: Tensor | None = None,
         return_cached_kv = False
     ):
@@ -105,10 +111,7 @@ class Attention(Module):
         if exists(self.rotary_pos_emb):
             q, k = self.rotary_pos_emb.rotate_queries_with_cached_keys(q, k)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal = True
-        )
+        out, _ = self.attend(q, k, v, mask = mask)
 
         out = self.merge_heads(out)
 
