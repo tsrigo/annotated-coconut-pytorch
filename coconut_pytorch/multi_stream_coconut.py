@@ -70,13 +70,10 @@ class Attention(Module):
         dim_head = 64,
         heads = 8,
         attend_kwargs: dict = dict(),
-        rotary_pos_emb: RotaryEmbedding | None = None
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
-
-        self.rotary_pos_emb = rotary_pos_emb
 
         self.norm = nn.RMSNorm(dim)
 
@@ -138,7 +135,8 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
-        ff_mult = 4
+        ff_mult = 4,
+        attend_kwargs: dict = dict()
     ):
         super().__init__()
         self.dim = dim
@@ -150,7 +148,7 @@ class Transformer(Module):
 
         for _ in range(depth):
             layers.append(ModuleList([
-                Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_pos_emb = self.rotary_emb),
+                Attention(dim = dim, dim_head = dim_head, heads = heads, attend_kwargs = attend_kwargs),
                 FeedForward(dim = dim, mult = ff_mult)
             ]))
 
