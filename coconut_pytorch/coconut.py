@@ -429,10 +429,9 @@ class Coconut(Module):
 
         # route to right functions
 
-        if should_checkpoint:
-            latent_token, latent_tokens, cached_kv, mask = self.checkpointed_recurrent_latent_forward(latent_token, cached_kv, mask = mask)
-        else:
-            latent_token, latent_tokens, cached_kv, mask = self.recurrent_latent_forward(latent_token, cached_kv, mask = mask)
+        latent_reasoning_fn = self.checkpointed_recurrent_latent_forward if should_checkpoint else self.recurrent_latent_forward
+
+        latent_token, latent_tokens, cached_kv, mask = latent_reasoning_fn(latent_token, cached_kv, mask = mask)
 
         # final model forward inputs
 
