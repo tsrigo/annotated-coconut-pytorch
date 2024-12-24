@@ -237,6 +237,7 @@ class Coconut(Module):
         transformer: dict | Transformer,
         num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
         learn_begin_of_thought = False,
+        begin_thought_loss_weight = 1.,
         checkpoint = False
     ):
         super().__init__()
@@ -260,6 +261,8 @@ class Coconut(Module):
         # whether to teach model when to begin a thought
 
         self.learn_begin_of_thought = learn_begin_of_thought
+        self.begin_thought_loss_weight = begin_thought_loss_weight
+
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
         # checkpoint
@@ -472,7 +475,10 @@ class Coconut(Module):
 
         loss_breakdown = (answer_loss, bot_loss)
 
-        total_loss = (answer_loss + bot_loss)
+        total_loss = (
+            answer_loss +
+            bot_loss * self.begin_thought_loss_weight
+        )
 
         if not return_intermediates:
             return total_loss
