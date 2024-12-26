@@ -23,6 +23,15 @@ def default(v, d):
     return v if exists(v) else d
 
 def append(t, value, num = 1):
+    '''
+    :param t: Tensor, 要进行填充的张量
+    :param value: Tensor, 用于填充的值
+    :param num: int, 填充的数量，默认为 1
+    :return: Tensor
+    
+    功能：在张量 t 的最后一个维度上填充指定数量 num 的值 value
+    '''
+
     return F.pad(t, (0, num), value = value)
 
 # sampling helpers
@@ -251,18 +260,18 @@ class Coconut(Module):
         self.num_reasoning_steps = num_reasoning_steps
 
         # begin and end of thought tokens, handled external to transformer
-
-        self.begin_of_thought = nn.Parameter(torch.zeros(num_latents_per_step, dim))
+        # 即论文中的<bot>和<eot>，这里是可训练的参数
+        self.begin_of_thought = nn.Parameter(torch.zeros(num_latents_per_step, dim))    # 可训练参数的类
         self.end_of_thought = nn.Parameter(torch.zeros(dim))
 
         nn.init.normal_(self.begin_of_thought, std = 0.02)
         nn.init.normal_(self.end_of_thought, std = 0.02)
 
         # whether to teach model when to begin a thought
-
+        # 文中提到了两种方式，一种是固定的，一种是可训练的
         self.learn_begin_of_thought = learn_begin_of_thought
         self.begin_thought_loss_weight = begin_thought_loss_weight
-
+        # 存储不需要持久化的辅助数据 zero,不会被保存到模型的 state_dict 中
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
         # checkpoint
@@ -385,21 +394,28 @@ class Coconut(Module):
         if exists(answer) and isinstance(answer, (list, tuple)):
             answer = pad_sequence(answer, padding_value = -1, batch_first = True)
 
-        mask = prompt >= 0
+        mask = prompt >= 0  # 生成一个布尔数组，用于表示哪些位置满足“prompt ≥ 0”的条件
 
-        prompt = prompt.masked_fill(~mask, 0)
+        prompt = prompt.masked_fill(~mask, 0) # 反掩码，将 prompt 不满足 mask 条件的位置填充为 0
 
         # shape and variables
-
+        # prompt 的形状是 [batch, seq]，num_thoughts 的形状是 [num_latents_per_step, dim]
+        # batch 是一次处理的数据样本数量，seq 是每个样本的 token 数量
+        # num_latents_per_step (或者说 num_thoughts) 控制模型在每个推理步骤中生成和使用的内部潜在表示数量的参数
         batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
 
         # prepare <bot> and <eot> in paper
-
+        # 目的:方便批处理操作，每个样本都有相同的“开始思考”和“结束思考”向量
+        # self.begin_of_thought 的形状是 [num_latents_per_step, dim]，self.end_of_thought 的形状是 [dim]
+        # 默认情况下,分别是[1, 512]和[512]
         begin_thought = repeat(self.begin_of_thought, 'n d -> b n d', b = batch)
         end_thought = repeat(self.end_of_thought, 'd -> b 1 d', b = batch)
 
         # give the model the prompt
-
+        # mask 的形状是 [batch, seq]，mask 的值是布尔值，用于表示哪些位置满足“prompt ≥ 0”的条件
+        # num_thoughts 的值是一个标量，表示每个推理步骤中生成和使用的内部潜在表示数量
+        # 向 mask 末尾添加 num_thoughts 个 True 值 (True 表示不 mask),和 prompt 对齐
+        # 添加之后,mask 的形状是 [batch, seq + num_thoughts]
         mask = append(mask, True, num_thoughts)
 
         prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], mask = mask, return_intermediates = True)
