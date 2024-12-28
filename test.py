@@ -1,5 +1,5 @@
 import torch
-from coconut_pytorch import Coconut
+from src.coconut_pytorch import Coconut
 
 model = Coconut(
     num_reasoning_steps = 3,
@@ -11,8 +11,8 @@ model = Coconut(
     )
 )
 
-prompt = torch.randint(0, 256, (2, 1024))   # 大小为 (2, 1024) 的随机张量, 相当于 2 个 prompt，每个 1024 个 token
-answer = torch.randint(0, 256, (2, 64))   
+prompt = torch.randint(0, 256, (1, 54))   # 大小为 (2, 1024) 的随机张量, 相当于 2 个 prompt，每个 1024 个 token
+answer = torch.randint(0, 256, (1, 54))   
 
 loss = model(prompt, answer)
 loss.backward()

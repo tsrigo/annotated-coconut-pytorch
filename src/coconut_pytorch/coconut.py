@@ -11,6 +11,8 @@ from torch.utils.checkpoint import checkpoint_sequential
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaList, GenerationConfig, LogitsProcessorList
+
 
 from x_transformers.attend import Attend
 
@@ -244,39 +246,45 @@ class Coconut(Module):
         self,
         num_reasoning_steps,
         transformer: dict | Transformer,
-        num_latents_per_step = 1, # extending the paper, allow for more than one "reasoning" token per step
-        learn_begin_of_thought = False,
-        begin_thought_loss_weight = 1.,
-        checkpoint = False
+        num_latents_per_step = 1,  # 每个推理步骤生成的潜在变量数，扩展了论文，支持每步更多潜在变量
+        learn_begin_of_thought = False,  # 是否学习思考开始的标记
+        begin_thought_loss_weight = 1.,  # 思考开始的损失权重
+        checkpoint = False,  # 是否使用检查点优化内存
+        base_model = 'openai-community/gpt2',  # 基础模型
+        tokenizer_name = 'openai-community/gpt2'  # 分词器名称
     ):
         super().__init__()
 
+        # 如果传入的 transformer 是字典形式，则实例化 Transformer 对象
         if isinstance(transformer, dict):
             transformer = Transformer(**transformer)
 
-        dim = transformer.dim
+        dim = transformer.dim  # transformer 的嵌入维度
 
+        # 初始化模型、推理步骤数等参数
         self.model = transformer
         self.num_reasoning_steps = num_reasoning_steps
 
-        # begin and end of thought tokens, handled external to transformer
-        # 即论文中的<bot>和<eot>，这里是可训练的参数
-        self.begin_of_thought = nn.Parameter(torch.zeros(num_latents_per_step, dim))    # 可训练参数的类
-        self.end_of_thought = nn.Parameter(torch.zeros(dim))
+        # <bot> 和 <eot> token，论文中用于标记思考开始和结束
+        self.begin_of_thought = nn.Parameter(torch.zeros(num_latents_per_step, dim))  # 可训练的思考开始 token
+        self.end_of_thought = nn.Parameter(torch.zeros(dim))  # 可训练的思考结束 token
 
-        nn.init.normal_(self.begin_of_thought, std = 0.02)
-        nn.init.normal_(self.end_of_thought, std = 0.02)
+        # 使用正态分布初始化这两个 token
+        nn.init.normal_(self.begin_of_thought, std=0.02)
+        nn.init.normal_(self.end_of_thought, std=0.02)
 
-        # whether to teach model when to begin a thought
-        # 文中提到了两种方式，一种是固定的，一种是可训练的
+        # 是否学习思考开始标记
         self.learn_begin_of_thought = learn_begin_of_thought
         self.begin_thought_loss_weight = begin_thought_loss_weight
-        # 存储不需要持久化的辅助数据 zero,不会被保存到模型的 state_dict 中
-        self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
-        # checkpoint
+        # 用于存储不需要持久化的零向量
+        self.register_buffer('zero', torch.tensor(0.), persistent=False)
 
+        # 是否使用检查点进行优化
         self.checkpoint = checkpoint
+
+        self.base_model = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     @torch.no_grad()
     def generate(
@@ -287,6 +295,18 @@ class Coconut(Module):
         filter_kwargs: dict = dict(),
         temperature = 1.
     ):
+        '''
+        这段代码实现了自回归（autoregressive）的生成方式。
+        0. 应用 forward 函数，获取 answer_logits
+        1. 初始化输出
+        2. 定义 sample 函数，用于从 logits 中采样
+            2.1 初始采样，从 answer_logits 中采样
+            2.2 逐步采样，将 answer_logits 作为 transform 的输入，获取下一个 token 的 logits，然后 sample
+        3. 逐步生成，直到达到最大长度
+
+        流程图：
+        prompt -> forward -> answer_logits -> sample -> out -> answer_logits -> sample -> out -> ... -> out
+        '''
         prompt_logits, latent_tokens, answer_logits, cached_kv = self.forward(prompt)
 
         out = prompt[:, 0:0]
@@ -327,7 +347,7 @@ class Coconut(Module):
             i += 1
 
             mask = append(mask, True, num_thoughts)
-
+            # return_embed_with_cache_kv = True，返回 embeds 和 cached_kv
             latent_token, cached_kv = self.model(latent_token, cached_kv = cached_kv, mask = mask, return_embed_with_cache_kv = True)
 
             latent_tokens[i] = latent_token
@@ -357,9 +377,13 @@ class Coconut(Module):
         num_thoughts = latent_token.shape[-2]
 
         # latent reasoning is a recurrent model forward with the last hidden state being passed back in as input, while the prompt key / values are kept the same (prompt is NOT passed back in)
-
+        # 潜在推理是一个循环模型，其中最后一个隐藏状态被回传作为输入，而提示键/值保持不变（提示不会被回传）。
         latent_tokens = [latent_token]
 
+        # 在这里，latent_token 的数量增加了 num_reasoning_steps - 1 个
+        # 也就是论文当中的添加隐含推理的过程
+        # 为什么要减 1 呢？因为在 forward 函数中，已经进行了一次推理（生成了一个latent_token），所以这里只需要进行 num_reasoning_steps - 1 次推理
+        # 或者说因为输入的 latent_token 已经是第一个 token 了，最后返回的 latent_token 数量就是 num_reasoning_steps
         for _ in range(self.num_reasoning_steps - 1):
 
             mask = append(mask, True, num_thoughts)
@@ -374,126 +398,92 @@ class Coconut(Module):
         self,
         prompt: Tensor | list[Tensor],
         answer: Tensor | list[Tensor] | None = None,
-        return_loss = True,
-        return_intermediates = False
+        return_loss=True,
+        return_intermediates=False
     ):
         """
-        ein notation:
-        b - batch
-        h - attention heads
-        n - seq (number of reasoning tokens, etc)
-        d - feature dimension
-        l - logits (num tokens)
+        前向传播方法，处理输入 prompt 和 answer，执行推理逻辑。
+        输入：prompt - 输入序列；answer - 目标序列（可选）；return_loss - 是否返回损失；return_intermediates - 是否返回中间结果。
         """
 
-        # handle variable length prompts
-
+        # 处理可变长度的 prompt 序列
         if isinstance(prompt, (list, tuple)):
-            prompt = pad_sequence(prompt, padding_value = -1, batch_first = True)
+            prompt = pad_sequence(prompt, padding_value=-1, batch_first=True)
 
         if exists(answer) and isinstance(answer, (list, tuple)):
-            answer = pad_sequence(answer, padding_value = -1, batch_first = True)
+            answer = pad_sequence(answer, padding_value=-1, batch_first=True)
 
-        mask = prompt >= 0  # 生成一个布尔数组，用于表示哪些位置满足“prompt ≥ 0”的条件
+        # 创建一个掩码，标记哪些位置是有效的（prompt >= 0）
+        mask = prompt >= 0
+        prompt = prompt.masked_fill(~mask, 0)  # 将无效位置填充为 0
 
-        prompt = prompt.masked_fill(~mask, 0) # 反掩码，将 prompt 不满足 mask 条件的位置填充为 0
-
-        # shape and variables
-        # prompt 的形状是 [batch, seq]，num_thoughts 的形状是 [num_latents_per_step, dim]
-        # batch 是一次处理的数据样本数量，seq 是每个样本的 token 数量
-        # num_latents_per_step (或者说 num_thoughts) 控制模型在每个推理步骤中生成和使用的内部潜在表示数量的参数
+        # 获取输入的 batch 大小和潜在变量的维度
         batch, num_thoughts = prompt.shape[0], self.begin_of_thought.shape[0]
 
-        # prepare <bot> and <eot> in paper
-        # 目的:方便批处理操作，每个样本都有相同的“开始思考”和“结束思考”向量
-        # self.begin_of_thought 的形状是 [num_latents_per_step, dim]，self.end_of_thought 的形状是 [dim]
-        # 默认情况下,分别是[1, 512]和[512]
-        begin_thought = repeat(self.begin_of_thought, 'n d -> b n d', b = batch)
-        end_thought = repeat(self.end_of_thought, 'd -> b 1 d', b = batch)
+        # 准备 <bot> 和 <eot> token
+        begin_thought = repeat(self.begin_of_thought, 'n d -> b n d', b=batch)
+        end_thought = repeat(self.end_of_thought, 'd -> b 1 d', b=batch)
 
-        # give the model the prompt
-        # mask 的形状是 [batch, seq]，mask 的值是布尔值，用于表示哪些位置满足“prompt ≥ 0”的条件
-        # num_thoughts 的值是一个标量，表示每个推理步骤中生成和使用的内部潜在表示数量
-        # 向 mask 末尾添加 num_thoughts 个 True 值 (True 表示不 mask),和 prompt 对齐
-        # 添加之后,mask 的形状是 [batch, seq + num_thoughts]
+        # 给模型输入 prompt 和 <bot> token
         mask = append(mask, True, num_thoughts)
+        prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], mask=mask, return_intermediates=True)
 
-        prompt_logits, embeds, cached_kv = self.model([prompt, begin_thought], mask = mask, return_intermediates = True)
-
-        # loss for decoding a <bot>
-
+        # 如果需要，计算 <bot> token 的损失
         bot_loss = self.zero
-
         if self.learn_begin_of_thought:
             pred_bot_embed, rest_logits = embeds[:, -2], prompt_logits[:, -2]
-
             pred_bot_logits = einsum('b d, n d -> b', pred_bot_embed, self.begin_of_thought)
             pred_bot_logits = rearrange(pred_bot_logits, 'b -> b 1')
-
-            bot_logits = cat((pred_bot_logits, rest_logits), dim = -1)
-            bot_labels = bot_logits.new_zeros((batch,), dtype = torch.long)
-
+            bot_logits = cat((pred_bot_logits, rest_logits), dim=-1)
+            bot_labels = bot_logits.new_zeros((batch,), dtype=torch.long)
             bot_loss = F.cross_entropy(bot_logits, bot_labels)
 
-        # extract latent reasoning token off <bot> position
-
+        # 提取潜在的推理 token
         latent_token = embeds[:, -num_thoughts:]
 
-        # whether to checkpoint or not
-
+        # 如果使用检查点，则选择相应的前向函数
         should_checkpoint = self.training and self.checkpoint and latent_token.requires_grad
-
-        # route to right functions
-
         latent_reasoning_fn = self.checkpointed_recurrent_latent_forward if should_checkpoint else self.recurrent_latent_forward
 
-        latent_token, latent_tokens, cached_kv, mask = latent_reasoning_fn(latent_token, cached_kv, mask = mask)
+        # 通过循环推理过程更新 latent token
+        # 当 c = 1 时，latent_tokens = [latent_token]
+        latent_token, latent_tokens, cached_kv, mask = latent_reasoning_fn(latent_token, cached_kv, mask=mask)
 
-        # final model forward inputs
-
+        # 最终前向输入，合并 latent token 和 <eot> token
+        # TODO: 为什么只用了一个 latent_token，而不是 latent_tokens？
         final_forward = [latent_token, end_thought]
-
         mask = append(mask, True, 1 + num_thoughts)
 
         if exists(answer):
-            answer_input = answer[..., :-1]
+            answer_input = answer[..., :-1] # TODO: 最后一个 token 是？
             answer_input_mask = answer_input >= 0
-
             answer_input = answer_input.masked_fill(~answer_input_mask, 0)
-
-            mask = torch.cat((mask, answer_input_mask), dim = -1)
-
+            mask = torch.cat((mask, answer_input_mask), dim=-1)
             final_forward.append(answer_input)
 
-        # final step, latent token and end thought token, as well as answer sequence is appended together
-
-        logits = self.model(final_forward, cached_kv = cached_kv, mask = mask)
-
+        # 最终模型计算输出 logits
+        logits = self.model(final_forward, cached_kv=cached_kv, mask=mask)
         answer_logits = logits[:, num_thoughts:]
 
-        # concat the latent reasoning tokens to be passed out for study
+        # 合并潜在推理 tokens 以供进一步研究
+        latent_tokens = cat(latent_tokens, dim=-2)
 
-        latent_tokens = cat(latent_tokens, dim = -2)
-
+        # 返回中间结果
         intermediates = prompt_logits, latent_tokens, answer_logits, cached_kv
 
         if not return_loss or not exists(answer):
             return intermediates
 
-        # handle the loss on the answers
-
+        # 计算 answer 的损失
         answer_loss = F.cross_entropy(
             rearrange(answer_logits, 'b n l -> b l n'),
             answer,
-            ignore_index = -1
+            ignore_index=-100
         )
 
+        # 返回总损失
         loss_breakdown = (answer_loss, bot_loss)
-
-        total_loss = (
-            answer_loss +
-            bot_loss * self.begin_thought_loss_weight
-        )
+        total_loss = answer_loss + bot_loss * self.begin_thought_loss_weight
 
         if not return_intermediates:
             return total_loss
