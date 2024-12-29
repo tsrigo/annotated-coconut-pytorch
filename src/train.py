@@ -7,6 +7,7 @@ import inspect
 import logging
 import random
 import torch
+import json
 
 from torch.utils.data import DataLoader
 from transformers import AdamW
@@ -14,12 +15,13 @@ from transformers import AdamW
 from data import CoTDataset, CoTDataCollator, extract_answer
 from utils import get_sep_position, batch_ids, save_model
 from transformers import AutoTokenizer
-import torchvision
 from torch.utils.tensorboard import SummaryWriter
 from torch import nn
 # from coconut_pytorch import Coconut
 from coconut_pytorch import Coconut
 from torch.utils.tensorboard import SummaryWriter
+import time
+st = time.time()
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -42,12 +44,12 @@ def compute_lambda_distribution(removal_smoothing_lambda, truncate_length=100):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='gpt2')
-    parser.add_argument('--train_path', type=str, default='D:\\Projects\\annotated-coconut-pytorch\\data\\gsm8k\\middletrain.txt')
-    parser.add_argument('--val_path', type=str, default='D:\\Projects\\annotated-coconut-pytorch\\data\\gsm8k\\smallvalid.txt')
-    parser.add_argument('--test_path', type=str, default='D:\\Projects\\annotated-coconut-pytorch\\data\\gsm8k\\smalltest.txt')
+    parser.add_argument('--train_path', type=str, default='data/gsm8k/train.txt')
+    parser.add_argument('--val_path', type=str, default='data/gsm8k/smallvalid.txt')
+    parser.add_argument('--test_path', type=str, default='data/gsm8k/test.txt')
     parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--accumulate', type=int, default=1)
     parser.add_argument('--remove_per_epoch', type=float, default=8)
     parser.add_argument('--remove_all_when_remove_beyond', type=str, default='inf')
@@ -87,7 +89,7 @@ def main():
     if args.bf16:
         dtype = 'bfloat16'
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
     # device = torch.device('cpu') 
     ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
     print (ptdtype, dtype, device)
@@ -138,8 +140,8 @@ def main():
     collate_fn = CoTDataCollator(tokenizer)
     train_dataset = CoTDataset(tokenizer, args.train_path, args.truncation, max_size=args.max_size)
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=True)
-    val_dataset = CoTDataset(tokenizer, args.val_path, args.truncation)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
+    # val_dataset = CoTDataset(tokenizer, args.val_path, args.truncation)
+    # val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
     if args.test_path:
         test_dataset = CoTDataset(tokenizer, args.test_path, args.truncation)
         test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
@@ -165,6 +167,8 @@ def main():
     remove_step_counter = 0
     best_val_accuracy = float('-inf')
 
+    writer = SummaryWriter("../logs_train")
+    total_test_step = 0
     all_cot_removed_in_prev_batch = False
     for epoch in range(args.epochs):
         if scheduled_to_remove < float('inf'):
@@ -258,13 +262,17 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if step % 100 == 0:
-                # token_accuracy = outputs.token_accuracy.item()
-                # ppl = loss.exp().item()
-                token_accuracy = -1
-                ppl = -1
-                # TODO: token_accuracy, ppl
-                print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
+            # if step % 100 == 0:
+            #     # token_accuracy = outputs.token_accuracy.item()
+            #     # ppl = loss.exp().item()
+            #     token_accuracy = -1
+            #     ppl = -1
+            #     # TODO: token_accuracy, ppl
+            #     print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
+            if step % 1000 == 0:
+                print("训练{}次所用时间：{}".format(step, time.time()-st))
+                print("训练次数：{}, Loss: {}".format(step, loss.item()))
+                writer.add_scalar("train_loss", loss.item(), step)
             step += 1
         print (f'Scheduled to remove: {scheduled_to_remove}')
         # accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
@@ -280,20 +288,37 @@ def main():
         model.eval()
         total_test_loss = 0
         total_accuracy = 0
+        results = []
+        json_file_path = 'test_results_decoded.json'
         with torch.no_grad():
-            for batch in test_dataloader:
+            for batch in tqdm.tqdm(test_dataloader):
                 input_ids = batch['input_ids_all'].to(device)
                 labels = batch['labels_all'].to(device)
                 loss, (loss_breakdown, *intermediates) = model(input_ids, labels, return_intermediates = True)
                 outputs = model.generate(input_ids, max_length = 64) # (2, 64)
                 total_test_loss = total_test_loss + loss.item()
-                filtered_labels = [token_id for token_id in labels[0] if token_id >= 0]
-                filtered_answer = [token_id for token_id in outputs[0] if token_id >= 0]
-                print("Answer: ", tokenizer.decode(filtered_labels, skip_special_tokens=True))
-                print("Output: ", tokenizer.decode(filtered_answer, skip_special_tokens=True))
-                accuracy = 0
-                total_accuracy = total_accuracy + accuracy
-
+                for i in range(input_ids.shape[0]):
+                    input_ids_tmp = input_ids[i].unsqueeze(0)
+                    labels_tmp = labels[i].unsqueeze(0)
+                    outputs = model.generate(input_ids_tmp, max_length = 64)
+                    filtered_input = [token_id for token_id in input_ids_tmp[0] if token_id >= 0]
+                    filtered_labels = [token_id for token_id in labels_tmp[0] if token_id >= 0]
+                    filtered_answer = [token_id for token_id in outputs[0] if token_id >= 0]
+                    decoded_input = tokenizer.decode(filtered_input, skip_special_tokens=True)
+                    decoded_labels = tokenizer.decode(filtered_labels, skip_special_tokens=True)
+                    decoded_answer = tokenizer.decode(filtered_answer, skip_special_tokens=True)
+                    accuracy = 1 if decoded_labels == decoded_answer else 0
+                    # 准备要保存的数据结构
+                    data_to_save = {
+                        'input_text': decoded_input,
+                        'label_text': decoded_labels,
+                        'answer_text': decoded_answer,
+                        'accuracy': accuracy
+                    }
+                    results.append(data_to_save)
+                    total_accuracy = total_accuracy + accuracy
+        with open(json_file_path, 'w') as file:
+            json.dump(results, file, indent=4, ensure_ascii=False)        
         print("整体测试集上的Loss: {}".format(total_test_loss))
         print("整体测试集上的正确率: {}".format(total_accuracy/test_data_size))
         writer.add_scalar("test_loss", total_test_loss, total_test_step)
