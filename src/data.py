@@ -52,7 +52,7 @@ class CoTDataset(Dataset):
         edited_sents_all = []
         #edited_sents_nocot = []
         self.examples_all = []
-        for src, tgt in zip(src_lines, tgt_lines):
+        for src, tgt in tqdm.tqdm(zip(src_lines, tgt_lines), total=min(len(src_lines), len(tgt_lines)), desc="Loading Database"):
             #import pdb; pdb.set_trace()
             ans = extract_answer(tgt)
             cot = extract_cot(tgt)
@@ -69,8 +69,8 @@ class CoTDataset(Dataset):
             else:
                 batch_encoding_all = tokenizer([sent], add_special_tokens=True)
             self.examples_all.append(batch_encoding_all["input_ids"][0])
-            if len(self.examples_all) % 1000 == 0:
-                print (len(self.examples_all))
+            # if len(self.examples_all) % 1000 == 0:
+            #     print (len(self.examples_all))
 
         separator = tokenizer.eos_token_id #tokenizer(eos_tok, add_special_tokens=False)['input_ids'][0]
         self.separator = separator

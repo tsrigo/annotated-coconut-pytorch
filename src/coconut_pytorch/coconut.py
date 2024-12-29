@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaList, GenerationConfig, LogitsProcessorList
 from transformers import GPT2LMHeadModel, GPT2Config
-
+from torch.nn import CrossEntropyLoss
 
 from x_transformers.attend import Attend
 
@@ -333,6 +333,7 @@ class Coconut(Module):
         learn_begin_of_thought = False,  # 是否学习思考开始的标记
         begin_thought_loss_weight = 1.,  # 思考开始的损失权重
         checkpoint = False,  # 是否使用检查点优化内存
+        model = 'gpt2',
         base_model = 'openai-community/gpt2',  # 基础模型
         tokenizer_name = 'openai-community/gpt2'  # 分词器名称
     ):
@@ -343,13 +344,19 @@ class Coconut(Module):
         #     transformer = Transformer(**transformer)
 
         # dim = transformer.dim  # transformer 的嵌入维度
-        
-
-        # 初始化模型、推理步骤数等参数
-        # self.model = transformer
-        self.model = CustomGPT2LMHeadModel()
-        dim = self.model.dim
-        
+        if model == 'transformer':
+            print("transformer")
+            if isinstance(transformer, dict):
+                transformer = Transformer(**transformer)
+            dim = transformer.dim
+            self.model = transformer
+        elif model == 'gpt2':
+            print("gpt2")
+            self.model = CustomGPT2LMHeadModel()
+            dim = self.model.dim
+        else:
+            raise ValueError("model must be 'transformer' or 'gpt2'")
+                
         self.num_reasoning_steps = num_reasoning_steps
 
         # <bot> 和 <eot> token，论文中用于标记思考开始和结束
@@ -370,8 +377,8 @@ class Coconut(Module):
         # 是否使用检查点进行优化
         self.checkpoint = checkpoint
 
-        self.base_model = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        # self.base_model = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=True)
+        # self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     @torch.no_grad()
     def generate(
@@ -388,7 +395,7 @@ class Coconut(Module):
         1. 初始化输出
         2. 定义 sample 函数，用于从 logits 中采样
             2.1 初始采样，从 answer_logits 中采样
-            2.2 逐步采样，将 answer_logits 作为 transform 的输入，获取下一个 token 的 logits，然后 sample
+            2.2 逐步采样，将 answer_logits 作为 self.model 的输入，获取下一个 token 的 logits，然后 sample
         3. 逐步生成，直到达到最大长度
 
         流程图：
@@ -539,6 +546,8 @@ class Coconut(Module):
         # 最终前向输入，合并 latent token 和 <eot> token
         # TODO: 为什么只用了一个 latent_token，而不是 latent_tokens？
         final_forward = [latent_token, end_thought]
+        # final_forward = latent_tokens + [end_thought]
+        
         mask = append(mask, True, 1 + num_thoughts)
 
         if exists(answer):
@@ -576,3 +585,35 @@ class Coconut(Module):
             return total_loss
 
         return total_loss, (loss_breakdown, *intermediates)
+    
+    def compute_loss(self, input_ids, labels, position_ids=None, output_attentions=False):
+        loss, (loss_breakdown, *intermediates) = self.forward(input_ids, labels, return_intermediates = True)
+        prompt_logits, latent_tokens, answer_logits, cached_kv = intermediates
+        logits = answer_logits
+
+        labels_pred = logits.argmax(-1)
+        mask = labels[...,1:].ge(0)
+        correct_tokens = ((labels_pred[...,:-1] == labels[...,1:]) * mask).sum()
+        total_tokens = mask.sum()
+        token_accuracy = correct_tokens / total_tokens
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = CrossEntropyLoss()
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        # outputs.loss = loss
+        # outputs.token_accuracy = token_accuracy
+        # outputs.total_correct = correct_tokens
+        # outputs.total_loss = loss * total_tokens
+        # outputs.total_tokens = total_tokens
+        
+        outputs = {}
+        outputs['loss'] = loss
+        outputs['token_accuracy'] = token_accuracy
+        outputs['total_correct'] = correct_tokens
+        outputs['total_loss'] = loss * total_tokens
+        outputs['total_tokens'] = total_tokens
+        
+        return outputs
+

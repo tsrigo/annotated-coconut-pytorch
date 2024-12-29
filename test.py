@@ -4,12 +4,13 @@ from src.coconut_pytorch import Coconut
 device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
 model = Coconut(
     num_reasoning_steps = 3,
-    num_latents_per_step = 1,
+    num_latents_per_step = 2,
     transformer = dict(
         num_tokens = 256,
         dim = 512,
         depth = 6
-    )
+    ),
+    model = 'gpt2'
 ).to(device)
 
 
