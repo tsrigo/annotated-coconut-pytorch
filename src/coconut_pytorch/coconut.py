@@ -327,15 +327,13 @@ class CustomGPT2LMHeadModel(nn.Module):
 class Coconut(Module):
     def __init__(
         self,
-        num_reasoning_steps,
+        num_reasoning_steps,        # 表示模型进行 recurrent reasoning 的步数或轮次。换句话说，它是模型在生成最终输出之前，将输入通过自身处理多少次。扩展了论文。
         transformer: dict | Transformer,
-        num_latents_per_step = 1,  # 每个推理步骤生成的潜在变量数，扩展了论文，支持每步更多潜在变量
-        learn_begin_of_thought = False,  # 是否学习思考开始的标记
+        num_latents_per_step = 1,   # 每个推理步骤生成的 latent thought 数量；这个应该是论文中的 c
+        learn_begin_of_thought = False,  # 是否学习 <bot> token
         begin_thought_loss_weight = 1.,  # 思考开始的损失权重
-        checkpoint = False,  # 是否使用检查点优化内存
+        checkpoint = False,         # 是否使用检查点优化内存
         model = 'gpt2',
-        base_model = 'openai-community/gpt2',  # 基础模型
-        tokenizer_name = 'openai-community/gpt2'  # 分词器名称
     ):
         super().__init__()
 

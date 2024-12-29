@@ -23,6 +23,9 @@ from coconut_pytorch import Coconut
 import time
 from datetime import datetime
 
+sizesetting = ''
+
+
 st = time.time()
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -44,7 +47,7 @@ def compute_lambda_distribution(removal_smoothing_lambda, truncate_length=100):
 
 
 @torch.no_grad()
-def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_to_remove, removal_side, removal_smoothing_lambda, lambda_distribution, keep_position=False, disable_random_removal_offset=False):
+def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_to_remove, removal_side, removal_smoothing_lambda, lambda_distribution, keep_position=False, disable_random_removal_offset=False):
     model.eval()
     total_instances = 0
     total_tokens = 0
@@ -119,7 +122,7 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
             max_length=max_new_tokens,
             # stop_on_two_eos=stop_on_two_eos,
         )
-        json_file_path = f'res/{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.json'
+        results = []
         # Evaluate
         for i, (input_ids_all_i, beam_output_i) in enumerate(zip(input_ids_all, beam_output)):
             sep_position = sep_positions[i].item()
@@ -154,9 +157,9 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='gpt2')
-    parser.add_argument('--train_path', type=str, default='data/gsm8k/64000train.txt')
-    parser.add_argument('--val_path', type=str, default='data/gsm8k/valid.txt')
-    parser.add_argument('--test_path', type=str, default='data/gsm8k/test.txt')
+    parser.add_argument('--train_path', type=str, default=f'data/gsm8k/{sizesetting}64000train.txt')
+    parser.add_argument('--val_path', type=str, default=f'data/gsm8k/{sizesetting}valid.txt')
+    parser.add_argument('--test_path', type=str, default=f'data/gsm8k/{sizesetting}test.txt')
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -426,14 +429,15 @@ def main():
         # writer.add_scalar("test_loss", total_test_loss, total_test_step)
         # writer.add_scalar("test_accuracy", total_accuracy/test_data_size, total_test_step)
         # total_test_step = total_test_step + 1
-        
-        accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
+        json_file_path = f'res/eval_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.json'
+        accuracy, token_accuracy, ppl = evaluate(json_file_path, val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
         print (f'Disable Offset Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
         if accuracy > best_val_accuracy:
             print ('***best so far or removed more CoT tokens***')
             best_val_accuracy = accuracy
             if args.test_path:
-                accuracy, token_accuracy, ppl = evaluate(test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
+                json_file_path = f'res/test_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.json'
+                accuracy, token_accuracy, ppl = evaluate(json_file_path, test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
                 print (f'Test. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
         # model.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
 
