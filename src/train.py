@@ -7,6 +7,7 @@ import inspect
 import logging
 import random
 import torch
+torch.cuda.empty_cache()
 import json
 
 from torch.utils.data import DataLoader
@@ -19,8 +20,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn
 # from coconut_pytorch import Coconut
 from coconut_pytorch import Coconut
-from torch.utils.tensorboard import SummaryWriter
 import time
+from datetime import datetime
+
 st = time.time()
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -44,12 +46,12 @@ def compute_lambda_distribution(removal_smoothing_lambda, truncate_length=100):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='gpt2')
-    parser.add_argument('--train_path', type=str, default='data/gsm8k/train.txt')
+    parser.add_argument('--train_path', type=str, default='data/gsm8k/64000train.txt')
     parser.add_argument('--val_path', type=str, default='data/gsm8k/smallvalid.txt')
     parser.add_argument('--test_path', type=str, default='data/gsm8k/test.txt')
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--accumulate', type=int, default=1)
     parser.add_argument('--remove_per_epoch', type=float, default=8)
     parser.add_argument('--remove_all_when_remove_beyond', type=str, default='inf')
@@ -149,6 +151,7 @@ def main():
     test_data_size = len(test_dataset)
     # Create Optimizer
     trainable_params = list(model.parameters())
+    print (f'Number of trainable parameters: {sum(p.numel() for p in trainable_params)}')
     use_fused = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     extra_args = dict(fused=True) if use_fused else dict()
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
@@ -167,7 +170,7 @@ def main():
     remove_step_counter = 0
     best_val_accuracy = float('-inf')
 
-    writer = SummaryWriter("../logs_train")
+    writer = SummaryWriter("./logs_train")
     total_test_step = 0
     all_cot_removed_in_prev_batch = False
     for epoch in range(args.epochs):
@@ -185,7 +188,7 @@ def main():
             if epoch >= args.pretrain_epochs:
                 remove_step_counter += 1
             if scheduled_to_remove > prev_scheduled_to_remove:
-                print(f" -epoch {epoch}. step {step}. removing: {scheduled_to_remove}")
+                # print(f" -epoch {epoch}. step {step}. removing: {scheduled_to_remove}")
                 if args.reset_optimizer and (not all_cot_removed_in_prev_batch):
                     print ('RESETTING OPTIMIZER')
                     optimizer.zero_grad(set_to_none=True)
@@ -269,9 +272,9 @@ def main():
             #     ppl = -1
             #     # TODO: token_accuracy, ppl
             #     print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
-            if step % 1000 == 0:
-                print("训练{}次所用时间：{}".format(step, time.time()-st))
-                print("训练次数：{}, Loss: {}".format(step, loss.item()))
+            if step % 50 == 0:
+                # print("训练{}次所用时间：{}".format(step, time.time()-st))
+                # print("训练次数：{}, Loss: {}".format(step, loss.item()))
                 writer.add_scalar("train_loss", loss.item(), step)
             step += 1
         print (f'Scheduled to remove: {scheduled_to_remove}')
@@ -289,7 +292,7 @@ def main():
         total_test_loss = 0
         total_accuracy = 0
         results = []
-        json_file_path = 'test_results_decoded.json'
+        json_file_path = f'res/{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
         with torch.no_grad():
             for batch in tqdm.tqdm(test_dataloader):
                 input_ids = batch['input_ids_all'].to(device)

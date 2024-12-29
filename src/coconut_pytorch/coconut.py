@@ -12,6 +12,7 @@ from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaList, GenerationConfig, LogitsProcessorList
+from transformers import GPT2LMHeadModel, GPT2Config
 
 
 from x_transformers.attend import Attend
@@ -239,6 +240,88 @@ class Transformer(Module):
 
         return logits, embeds, next_keys_values
 
+
+class CustomGPT2LMHeadModel(nn.Module):
+    def __init__(self, vocab_size=50257, hidden_size=768, num_layers=12, num_heads=12):
+        super().__init__()
+        config = GPT2Config(
+            vocab_size=vocab_size,
+            n_embd=hidden_size,
+            n_layer=num_layers,
+            n_head=num_heads,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict_in_generate=True  # 确保返回字典格式的结果
+        )
+        self.model = GPT2LMHeadModel(config)
+        self.dim = hidden_size
+
+    def forward(
+        self,
+        inp,
+        cached_kv=None,
+        mask=None,
+        return_intermediates=False,
+        return_embed_with_cache_kv=False
+    ):
+        """
+        Forward pass through the model.
+        
+        Parameters:
+        - inp: Tensor 或多个 Tensor 的列表
+        - cached_kv: 前一次缓存的键值对
+        - mask: 可选的mask，用于防止模型不必要的关注
+        - return_intermediates: 是否返回(logits, 中间状态, cached_kv)
+        - return_embed_with_cache_kv: 是否只返回(embeds, cached_kv)
+        """
+        # 如果输入是单个 Tensor，则转为列表
+        if not isinstance(inp, list):
+            inp = [inp]
+
+        # 将列表中的 int/long 类型输入转换为 GPT-2 可处理的形式
+        # 这里只做简单拼接处理，实际应用可根据需要进一步定制
+        x = []
+        for t in inp:
+            if t.dtype in (torch.int, torch.long):
+                x.append(t)
+            else:
+                # 模拟直接使用 embedding 后的张量
+                # 如果需要更复杂的embedding逻辑，可在此添加
+                x.append(t.argmax(dim=-1) if t.dim() == 3 else t)
+
+        # 将所有输入拼接到一起
+        in_ids = torch.cat(x, dim=1)
+
+        # huggingface GPT2LMHeadModel forward 参数与本地命名差异
+        # past_key_values对应 cached_kv
+        # attention_mask对应 mask
+        outputs = self.model(
+            input_ids=in_ids,
+            past_key_values=cached_kv,
+            attention_mask=mask,
+            use_cache=True,
+            output_hidden_states=True,
+            # return_dict=True  # Ensure dictionary output format
+        )
+        # GPT2LMHeadModel 返回:
+        # logits, past_key_values, hidden_states, ...
+        logits = outputs.logits
+        next_cached_kv = outputs.past_key_values  # 下次可复用
+        hidden_states = outputs.hidden_states[-1]  # 最后一层隐藏层输出
+        
+
+        if return_embed_with_cache_kv:
+            # 返回 (embeddings, cached_kv)
+            return hidden_states, next_cached_kv
+
+        if return_intermediates:
+            # 返回 (logits, embeds, cached_kv)
+            return logits, hidden_states, next_cached_kv
+
+        # 默认仅返回 logits
+        return logits
+
+
 # coconut wrapper around transformer handles recurrence with latent reasoning tokens
 
 class Coconut(Module):
@@ -255,14 +338,18 @@ class Coconut(Module):
     ):
         super().__init__()
 
-        # 如果传入的 transformer 是字典形式，则实例化 Transformer 对象
-        if isinstance(transformer, dict):
-            transformer = Transformer(**transformer)
+        # # 如果传入的 transformer 是字典形式，则实例化 Transformer 对象
+        # if isinstance(transformer, dict):
+        #     transformer = Transformer(**transformer)
 
-        dim = transformer.dim  # transformer 的嵌入维度
+        # dim = transformer.dim  # transformer 的嵌入维度
+        
 
         # 初始化模型、推理步骤数等参数
-        self.model = transformer
+        # self.model = transformer
+        self.model = CustomGPT2LMHeadModel()
+        dim = self.model.dim
+        
         self.num_reasoning_steps = num_reasoning_steps
 
         # <bot> 和 <eot> token，论文中用于标记思考开始和结束
