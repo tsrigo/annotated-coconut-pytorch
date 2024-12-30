@@ -23,6 +23,7 @@ from coconut_pytorch import Coconut
 import time
 from datetime import datetime
 
+sizesetting = 'small'
 sizesetting = ''
 
 
@@ -47,7 +48,7 @@ def compute_lambda_distribution(removal_smoothing_lambda, truncate_length=100):
 
 
 @torch.no_grad()
-def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_to_remove, removal_side, removal_smoothing_lambda, lambda_distribution, keep_position=False, disable_random_removal_offset=False):
+def evaluate(temperature, json_file_path, dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_to_remove, removal_side, removal_smoothing_lambda, lambda_distribution, keep_position=False, disable_random_removal_offset=False):
     model.eval()
     total_instances = 0
     total_tokens = 0
@@ -60,7 +61,7 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
         input_ids_all = batch['input_ids_all'].to(device)
         labels = batch['labels_all'].to(device)
         # Remove answer part
-        sep_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id)
+        sep_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id)     # 第一个分隔符的位置。问题 <eos> 推理步骤 <eos> 答案 <eos>
         input_ids = input_ids_all[:, :sep_positions.max()+1]
         batch_size = input_ids.shape[0]
         first_sep_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id)
@@ -100,11 +101,6 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
             if keep_position:
                 position_ids_all = position_ids_all[:, :input_ids_all.shape[-1]]
             outputs = model.compute_loss(input_ids=input_ids_all, labels=labels, position_ids=position_ids_all)
-            # loss, (loss_breakdown, *intermediates) = model(input_ids, labels, return_intermediates = True)
-
-        # total_loss += outputs.total_loss.item()
-        # total_correct_tokens += outputs.total_correct.item()
-        # total_tokens += outputs.total_tokens
         
         total_loss += outputs['total_loss'].item()
         total_correct_tokens += outputs['total_correct'].item()
@@ -114,13 +110,20 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
 
         # Generate
         stop_on_two_eos = True
-        if keep_position:
-            position_ids = position_ids_all[:, :input_ids.shape[-1]]
-        beam_output = model.generate(
-            prompt=input_ids,
-            # position_ids=position_ids,
-            max_length=max_new_tokens,
-            # stop_on_two_eos=stop_on_two_eos,
+        # if keep_position:
+        #     position_ids = position_ids_all[:, :input_ids.shape[-1]]
+        # beam_output = model.generate(
+        #     prompt=input_ids,
+        #     # position_ids=position_ids,
+        #     max_length=max_new_tokens,
+        #     # stop_on_two_eos=stop_on_two_eos,
+        #     temperature = temperature
+        # )
+        beam_output = model.generate_by_icot(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            max_new_tokens=max_new_tokens,
+            stop_on_two_eos=stop_on_two_eos,
         )
         results = []
         # Evaluate
@@ -129,7 +132,7 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
             tgt = input_ids_all_i[sep_position+1:]
             tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
             ans = extract_answer(tgt_text)
-            pred_text = tokenizer.decode(beam_output_i[sep_position+1:], skip_special_tokens=True)
+            pred_text = tokenizer.decode(beam_output_i[0][0][sep_position+1:], skip_special_tokens=True)
             pred_ans = extract_answer(pred_text)
             if ans == pred_ans:
                 total_correct += 1
@@ -141,7 +144,9 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
             data_to_save = {
                 'input_text': tokenizer.decode(input_ids_all_i[:sep_position], skip_special_tokens=True),
                 'label_text': tgt_text,
-                'answer_text': pred_text,
+                'label_ans': ans,
+                'pred_text': pred_text,
+                'pred_ans': pred_ans,
                 'accuracy': 1 if ans == pred_ans else 0
             }
             results.append(data_to_save)
@@ -157,9 +162,10 @@ def evaluate(json_file_path, dataloader, tokenizer, device, ctx, model, max_new_
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='gpt2')
-    parser.add_argument('--train_path', type=str, default=f'data/gsm8k/{sizesetting}64000train.txt')
+    parser.add_argument('--train_path', type=str, default=f'data/gsm8k/{sizesetting}train.txt')
     parser.add_argument('--val_path', type=str, default=f'data/gsm8k/{sizesetting}valid.txt')
-    parser.add_argument('--test_path', type=str, default=f'data/gsm8k/{sizesetting}test.txt')
+    # parser.add_argument('--test_path', type=str, default=f'data/gsm8k/{sizesetting}test.txt')
+    parser.add_argument('--test_path', type=str, default=None)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -185,6 +191,7 @@ def main():
     parser.add_argument('--keep_position', action='store_true')
     parser.set_defaults(keep_position=False)
     parser.add_argument('--reinitialize_weights', action='store_true')
+    parser.add_argument('--temperature', type=float, default=1.0)
     parser.set_defaults(reinitialize_weights=False)
     args = parser.parse_args()
 
@@ -202,27 +209,28 @@ def main():
     if args.bf16:
         dtype = 'bfloat16'
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # device = torch.device('cpu') 
     ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
     print (ptdtype, dtype, device)
-    tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2')
     # Create model
     if args.from_pretrained is None:
         # config = ImplicitModelConfig(base_model=args.model)
         model = Coconut(
-            num_reasoning_steps = 3,
+            num_reasoning_steps = 1,
             num_latents_per_step = 2,
             transformer = dict(
-                num_tokens = tokenizer.vocab_size,
+                num_tokens = 256,
                 dim = 512,
                 depth = 6
-            )
+            ),
+            model = 'gpt2',
         )
     else:
         print (f'Loading from {args.from_pretrained}')
         # model = ImplicitModel.from_pretrained(args.from_pretrained).to(device).to(ptdtype)
     if 'gpt2' in args.model:
+        # 通过这一过程，GPT-2 能够适应更长的输入序列而不牺牲注意力规范。
         old_length = model.model.model.transformer.wpe.weight.shape[0]
         if args.truncation > old_length and args.from_pretrained is None:
             #import pdb; pdb.set_trace()
@@ -241,7 +249,7 @@ def main():
                 persistent=False,
             )
     model = model.to(device).to(ptdtype)
-    # tokenizer = model.tokenizer
+    tokenizer = model.tokenizer
     if args.reinitialize_weights:
         print ('reinitializing weights')
         model.model.model.apply(model.model.model._init_weights)
@@ -258,8 +266,11 @@ def main():
     if args.test_path:
         test_dataset = CoTDataset(tokenizer, args.test_path, args.truncation)
         test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
+        test_data_size = len(test_dataset)
+        print (f'Test data size: {test_data_size}.')
     train_data_size = len(train_dataset)
-    test_data_size = len(test_dataset)
+    val_data_size = len(val_dataset)
+    print (f'Train data size: {train_data_size}. Val data size: {val_data_size}.')
     # Create Optimizer
     trainable_params = list(model.parameters())
     print (f'Number of trainable parameters: {sum(p.numel() for p in trainable_params)}')
@@ -429,15 +440,18 @@ def main():
         # writer.add_scalar("test_loss", total_test_loss, total_test_step)
         # writer.add_scalar("test_accuracy", total_accuracy/test_data_size, total_test_step)
         # total_test_step = total_test_step + 1
-        json_file_path = f'res/eval_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.json'
-        accuracy, token_accuracy, ppl = evaluate(json_file_path, val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
+        json_file_dir = f'res/{train_data_size}/'
+        if not os.path.exists(f'res/{train_data_size}/'):
+            os.makedirs(f'res/{train_data_size}/')
+        json_file_path = os.path.join(json_file_dir, f'eval_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M")}.json')
+        accuracy, token_accuracy, ppl = evaluate(args.temperature, json_file_path, val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
         print (f'Disable Offset Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
         if accuracy > best_val_accuracy:
             print ('***best so far or removed more CoT tokens***')
             best_val_accuracy = accuracy
             if args.test_path:
-                json_file_path = f'res/test_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.json'
-                accuracy, token_accuracy, ppl = evaluate(json_file_path, test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
+                json_file_path = os.path.join(json_file_dir, f'test_{train_data_size}_{args.epochs}_{datetime.now().strftime("%Y-%m-%d_%H-%M")}.json')
+                accuracy, token_accuracy, ppl = evaluate(args.temperature, json_file_path, test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
                 print (f'Test. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
         # model.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
 

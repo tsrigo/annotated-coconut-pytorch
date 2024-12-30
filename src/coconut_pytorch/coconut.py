@@ -14,6 +14,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaList, GenerationConfig, LogitsProcessorList
 from transformers import GPT2LMHeadModel, GPT2Config
 from torch.nn import CrossEntropyLoss
+from utils import get_sep_position, DoubleEOSStoppingCriteria, DoubleEOSLogitsProcessor
 
 from x_transformers.attend import Attend
 
@@ -253,7 +254,9 @@ class CustomGPT2LMHeadModel(nn.Module):
             output_hidden_states=True,
             return_dict_in_generate=True  # 确保返回字典格式的结果
         )
-        self.model = GPT2LMHeadModel(config)
+        # self.model = GPT2LMHeadModel(config)
+        self.model = AutoModelForCausalLM.from_pretrained("gpt2", config=config, trust_remote_code=True)
+        self.config = config
         self.dim = hidden_size
 
     def forward(
@@ -334,6 +337,7 @@ class Coconut(Module):
         begin_thought_loss_weight = 1.,  # 思考开始的损失权重
         checkpoint = False,         # 是否使用检查点优化内存
         model = 'gpt2',
+        tokenizer_name = 'openai-community/gpt2',
     ):
         super().__init__()
 
@@ -376,7 +380,7 @@ class Coconut(Module):
         self.checkpoint = checkpoint
 
         # self.base_model = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=True)
-        # self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     @torch.no_grad()
     def generate(
@@ -399,6 +403,7 @@ class Coconut(Module):
         流程图：
         prompt -> forward -> answer_logits -> sample -> out -> answer_logits -> sample -> out -> ... -> out
         '''
+        raise NotImplementedError
         prompt_logits, latent_tokens, answer_logits, cached_kv = self.forward(prompt)
 
         out = prompt[:, 0:0]
@@ -417,6 +422,87 @@ class Coconut(Module):
 
         return out
 
+    def generate_by_icot(self, input_ids, max_new_tokens=512, num_beams=3, stop_on_two_eos=True, position_ids=None):
+        sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id)
+        batch_size = input_ids.shape[0]
+
+        # Since there's one eos after CoT and another after final answer, we need to wait for two eos
+        generation_config = GenerationConfig.from_model_config(self.model.config)
+        if hasattr(generation_config, 'pad_token_id'):
+            #generation_config.pad_token_id = -1 #TODO: this might not be necessary
+            generation_config.pad_token_id = None #TODO: this might not be necessary
+        if stop_on_two_eos:
+            generation_config.eos_token_id = -1
+            logits_processor = LogitsProcessorList([DoubleEOSLogitsProcessor(self.tokenizer.eos_token_id)])
+            stopping_criteria = StoppingCriteriaList([DoubleEOSStoppingCriteria(self.tokenizer.eos_token_id)])
+        else:
+            logits_processor = None
+            stopping_criteria = None
+
+        if sep_positions.eq(sep_positions[0]).all():
+            input_ids = input_ids[:, :sep_positions[0]+1]
+            if position_ids is not None:
+                position_ids = position_ids[:, :sep_positions[0]+1]
+                beam_output = self.model.model.generate(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    generation_config=generation_config,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    early_stopping=True,
+                    num_return_sequences=1,
+                    logits_processor=logits_processor,
+                    stopping_criteria=stopping_criteria,
+                )
+            else:
+                beam_output = self.model.model.generate(
+                    input_ids=input_ids,
+                    generation_config=generation_config,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    early_stopping=True,
+                    num_return_sequences=1,
+                    logits_processor=logits_processor,
+                    stopping_criteria=stopping_criteria,
+                )
+            beam_output = beam_output.unsqueeze(1)
+        else:
+            beam_output = []
+            for i in range(batch_size):
+                input_ids_i = input_ids[i:i+1]
+                sep_positions_i = sep_positions[i:i+1]
+                input_ids_i = input_ids_i[:, :sep_positions_i+1]
+                if position_ids is not None:
+                    position_ids_i = position_ids[i:i+1, :sep_positions_i+1]
+                else:
+                    position_ids_i = None
+                if position_ids_i is not None:
+                    beam_output_i = self.model.model.generate(
+                        input_ids=input_ids_i,
+                        position_ids=position_ids_i,
+                        generation_config=generation_config,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=num_beams,
+                        early_stopping=True,
+                        num_return_sequences=1,
+                        logits_processor=logits_processor,
+                        stopping_criteria=stopping_criteria,
+                    )
+                else:
+                    beam_output_i = self.model.model.generate(
+                        input_ids=input_ids_i,
+                        generation_config=generation_config,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=num_beams,
+                        early_stopping=True,
+                        num_return_sequences=1,
+                        logits_processor=logits_processor,
+                        stopping_criteria=stopping_criteria,
+                    )
+                beam_output.append(beam_output_i)
+        return beam_output
+
+    
     def checkpointed_recurrent_latent_forward(
         self,
         latent_token,

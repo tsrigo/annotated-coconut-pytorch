@@ -15,6 +15,7 @@ model = Coconut(
 
 
 prompt = torch.randint(0, 256, (1, 54))   # 大小为 (2, 1024) 的随机张量, 相当于 2 个 prompt，每个 1024 个 token
+prompt = torch.tensor([[1, 2, 3, 4, 5, 1, 2, 3, 4, 5], [5, 2, 3, 4, 1, 5, 2, 3, 4, 1]])
 answer = torch.randint(0, 256, (1, 54))   
 prompt, answer = prompt.to(device), answer.to(device)
 
@@ -23,6 +24,7 @@ loss.backward()
 
 # after much training
 
-answer = model.generate(prompt, max_length = 64) # (2, 64)
+answer = model.generate_by_icot(prompt)
+# answer = model.generate(prompt, max_length = 64) # (2, 64)
 print(prompt)
 print(answer)
